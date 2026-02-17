@@ -1,0 +1,7 @@
+# 忽略所有文件
+*
+
+# 允许排除（白名单）
+!dev_plan.md
+!.gitignore
+!guardian_final_spec.md
