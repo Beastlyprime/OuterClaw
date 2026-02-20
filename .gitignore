@@ -1,7 +1,22 @@
-# 忽略所有文件
+# Ignore all by default
 *
 
-# 允许排除（白名单）
-!dev_plan.md
+# ── Project files (whitelist) ──
 !.gitignore
-!guardian_final_spec.md
+!CLAUDE.md
+!dev_plan.md
+!deploy.sh
+!clawshell.py
+
+# Shell scripts
+!scripts/
+!scripts/*.sh
+
+# systemd units
+!systemd/
+!systemd/*.service
+!systemd/*.timer
+
+# Logrotate
+!logrotate/
+!logrotate/occlawshell

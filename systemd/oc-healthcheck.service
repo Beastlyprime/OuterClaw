@@ -1,0 +1,9 @@
+# /etc/systemd/system/oc-healthcheck.service
+[Unit]
+Description=OpenClaw Health Check Runner
+
+[Service]
+Type=oneshot
+User=occlawshell
+Group=occlawshell
+ExecStart=/var/lib/occlawshell/bin/healthcheck.sh

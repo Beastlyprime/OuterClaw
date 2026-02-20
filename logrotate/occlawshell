@@ -1,0 +1,9 @@
+/var/lib/occlawshell/audit/*.log {
+    daily
+    rotate 30
+    compress
+    delaycompress
+    missingok
+    notifempty
+    create 0600 occlawshell occlawshell
+}

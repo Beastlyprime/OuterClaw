@@ -1,0 +1,12 @@
+# /etc/systemd/system/oc-snapshot.timer
+[Unit]
+Description=ClawShell Snapshot (every 30 min)
+
+[Timer]
+OnBootSec=120
+OnUnitActiveSec=1800
+AccuracySec=30
+Persistent=true
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,11 @@
+# /etc/systemd/system/oc-healthcheck.timer
+[Unit]
+Description=OpenClaw Health Check (every 2 min)
+
+[Timer]
+OnBootSec=60
+OnUnitActiveSec=120
+AccuracySec=10
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,15 @@
+# /etc/systemd/system/oc-snapshot.service
+[Unit]
+Description=ClawShell Snapshot Runner
+
+[Service]
+Type=oneshot
+User=occlawshell
+Group=occlawshell
+
+ExecStart=/var/lib/occlawshell/bin/snapshot-sqlite.sh
+ExecStart=/var/lib/occlawshell/bin/snapshot-files.sh
+
+MemoryMax=512M
+IOWeight=50
+Nice=15

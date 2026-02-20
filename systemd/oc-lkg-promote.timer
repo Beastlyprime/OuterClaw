@@ -1,0 +1,13 @@
+# /etc/systemd/system/oc-lkg-promote.timer
+# Trigger LKG promotion every 2 hours (promote-lkg.sh has its own gate checks)
+[Unit]
+Description=OpenClaw LKG Promotion Timer
+
+[Timer]
+OnBootSec=3600
+OnUnitActiveSec=7200
+AccuracySec=60
+Persistent=true
+
+[Install]
+WantedBy=timers.target
