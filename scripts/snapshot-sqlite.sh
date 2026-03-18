@@ -50,7 +50,7 @@ if [[ "$ROW_COUNT" -eq 0 ]]; then
 fi
 
 # Step 3b: Row count regression detection — alert if >50% drop from previous snapshot
-PREV_SQL=$(ls -1t "${DST_DIR}"/main-*.sqlite 2>/dev/null | head -1)
+PREV_SQL=$(ls -1t "${DST_DIR}"/main-*.sqlite 2>/dev/null | head -1 || true)
 if [[ -n "$PREV_SQL" && -f "$PREV_SQL" ]]; then
     PREV_COUNT=$(sqlite3 "$PREV_SQL" "SELECT COUNT(*) FROM chunks;" 2>/dev/null || echo "0")
     if [[ "$PREV_COUNT" -gt 0 && "$ROW_COUNT" -gt 0 ]]; then
@@ -75,6 +75,6 @@ log "OK: ${DST} (${SHA:0:16}) size=${SIZE} rows=${ROW_COUNT}"
 
 # Step 7: Prune old snapshots (keep 96 = 48 hours at 30-min intervals)
 cd "$DST_DIR"
-ls -1t main-*.sqlite 2>/dev/null | tail -n +97 | xargs -r rm -f
+ls -1t main-*.sqlite 2>/dev/null | tail -n +97 | xargs -r rm -f || true
 
 exit 0

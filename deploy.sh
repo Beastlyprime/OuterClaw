@@ -78,15 +78,25 @@ echo "Phase 1c: Detect OpenClaw Installation"
 echo "───────────────────────────────────────"
 # Allow override: OPENCLAW_BIN=/path/to/openclaw sudo bash deploy.sh
 if [[ -z "${OPENCLAW_BIN:-}" ]]; then
-    # Method 1: Ask yimeng's login shell (finds nvm-managed installs)
-    OPENCLAW_BIN=$(sudo -u yimeng bash -lc 'command -v openclaw' 2>/dev/null) || true
+    # Method 1: Ask ocagent's login shell (preferred — this is who runs OpenClaw)
+    OPENCLAW_BIN=$(sudo -u "${AGENT_USER}" bash -lc 'command -v openclaw' 2>/dev/null) || true
 
-    # Method 2: Search nvm directories
+    # Method 2: Ask yimeng's login shell (finds nvm-managed installs)
     if [[ -z "$OPENCLAW_BIN" || ! -x "${OPENCLAW_BIN:-}" ]]; then
-        OPENCLAW_BIN=$(find /home/yimeng/.nvm -name openclaw -path '*/bin/openclaw' -type f 2>/dev/null | sort -V | tail -1) || true
+        OPENCLAW_BIN=$(sudo -u yimeng bash -lc 'command -v openclaw' 2>/dev/null) || true
     fi
 
-    # Method 3: System PATH
+    # Method 3: Search common global npm paths
+    if [[ -z "$OPENCLAW_BIN" || ! -x "${OPENCLAW_BIN:-}" ]]; then
+        for search_dir in "${AGENT_HOME}/.npm-global" /home/yimeng/.nvm /usr/local/lib; do
+            if [[ -d "$search_dir" ]]; then
+                OPENCLAW_BIN=$(find "$search_dir" -name openclaw -path '*/bin/openclaw' -type f 2>/dev/null | sort -V | tail -1) || true
+                [[ -n "$OPENCLAW_BIN" && -x "$OPENCLAW_BIN" ]] && break
+            fi
+        done
+    fi
+
+    # Method 4: System PATH
     if [[ -z "$OPENCLAW_BIN" || ! -x "${OPENCLAW_BIN:-}" ]]; then
         OPENCLAW_BIN=$(command -v openclaw 2>/dev/null) || true
     fi
@@ -121,6 +131,14 @@ echo "  ✓ Vault structure created at $VAULT"
 echo ""
 echo "Phase 3: Grant Read-Only ACL to occlawshell"
 echo "───────────────────────────────────────────"
+# Home directory traverse — occlawshell needs 'x' to reach .openclaw/
+setfacl -m u:occlawshell:x "${AGENT_HOME}"
+echo "  ✓ Home directory traverse ACL set"
+
+# .openclaw root traverse
+setfacl -m u:occlawshell:rx "${OPENCLAW_DIR}"
+echo "  ✓ .openclaw root ACL set"
+
 # Workspace
 setfacl -R -m u:occlawshell:rX "${WORKSPACE}"
 setfacl -R -d -m u:occlawshell:rX "${WORKSPACE}"

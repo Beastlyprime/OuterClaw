@@ -4,6 +4,8 @@
 Description=ClawShell Sentry
 After=openclaw-gateway.service
 Wants=openclaw-gateway.service
+StartLimitIntervalSec=600
+StartLimitBurst=10
 
 [Service]
 Type=notify
@@ -14,8 +16,6 @@ WorkingDirectory=/var/lib/occlawshell
 ExecStart=/usr/bin/python3 /var/lib/occlawshell/bin/clawshell.py
 Restart=always
 RestartSec=10
-StartLimitIntervalSec=600
-StartLimitBurst=10
 
 # Watchdog: systemd kills ClawShell if it stops reporting within 120s
 # ClawShell must call sd_notify("WATCHDOG=1") every <60s

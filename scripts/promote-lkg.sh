@@ -48,8 +48,8 @@ if [[ -x "$HEALTHCHECK" ]]; then
 fi
 
 # Find latest snapshots
-LATEST_SQL=$(ls -1t "${SNAP_DIR}"/main-*.sqlite 2>/dev/null | head -1)
-LATEST_FILES=$(ls -1dt "${SNAP_DIR}"/files-* 2>/dev/null | head -1)
+LATEST_SQL=$(ls -1t "${SNAP_DIR}"/main-*.sqlite 2>/dev/null | head -1 || true)
+LATEST_FILES=$(ls -1dt "${SNAP_DIR}"/files-* 2>/dev/null | head -1 || true)
 
 if [[ -z "$LATEST_SQL" ]]; then
     log "FAIL: No SQLite snapshots found"
@@ -119,7 +119,7 @@ ln -sfn "$LKG_SNAP" "${LKG_DIR}/current"
 
 # Prune old LKGs (keep 10)
 cd "$LKG_DIR"
-ls -1dt lkg-* 2>/dev/null | tail -n +11 | xargs -r rm -rf
+ls -1dt lkg-* 2>/dev/null | tail -n +11 | xargs -r rm -rf || true
 
 log "OK: ${LKG_SNAP}"
 "$ALERT" INFO "LKG promoted: ${LKG_SNAP}" 2>/dev/null || true

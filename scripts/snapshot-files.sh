@@ -72,6 +72,6 @@ log "OK: ${SNAP} (${FILE_COUNT} files, ${SIZE})"
 
 # Prune (keep 96 = 48h at 30-min intervals)
 cd "$DST_DIR"
-ls -1dt files-* 2>/dev/null | tail -n +97 | xargs -r rm -rf
+ls -1dt files-* 2>/dev/null | tail -n +97 | xargs -r rm -rf || true
 
 exit 0
