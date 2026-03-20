@@ -11,6 +11,12 @@ PM_DIR="/var/lib/occlawshell/postmortem/${TS}-${UNIT_NAME}"
 ALERT="/var/lib/occlawshell/bin/alert.sh"
 mkdir -p "$PM_DIR"
 
+# Quota warning (non-blocking — postmortem collection must always run)
+QUOTA_CHECK="/var/lib/occlawshell/bin/quota-check.sh"
+if [[ -x "$QUOTA_CHECK" ]]; then
+    "$QUOTA_CHECK" || echo "[$(date -Iseconds)] WARNING: Vault over quota during postmortem collection" >> "/var/lib/occlawshell/audit/backup.log"
+fi
+
 # Helper: redact secrets from environment variables
 redact_env() {
     sed -E 's/(TOKEN|KEY|SECRET|PASSWORD|APIKEY|API_KEY|CREDENTIAL)=[^ ]*/\1=<REDACTED>/gi'

@@ -19,6 +19,20 @@ DST_TMP="${DST}.tmp"
 
 log() { echo "[$(date -Iseconds)] $*" >> "${AUDIT_DIR}/backup.log"; }
 
+# Preflight: vault disk quota
+QUOTA_CHECK="/var/lib/occlawshell/bin/quota-check.sh"
+if [[ -x "$QUOTA_CHECK" ]] && ! "$QUOTA_CHECK"; then
+    log "SKIP: Vault over quota, snapshot deferred"
+    exit 0
+fi
+
+# Preflight: I/O pressure
+IO_CHECK="/var/lib/occlawshell/bin/io-pressure-check.sh"
+if [[ -x "$IO_CHECK" ]] && ! "$IO_CHECK"; then
+    log "SKIP: I/O pressure too high, snapshot deferred"
+    exit 0
+fi
+
 # Preflight: source must exist and be readable
 if [[ ! -r "$SRC" ]]; then
     log "FAIL: Source $SRC not readable"

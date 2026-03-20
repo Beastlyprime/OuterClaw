@@ -116,9 +116,9 @@ ClawShell 只做 OpenClaw 不可能自己做的事：
 - [x] 验证无 sudo: `sudo -u ocagent sudo -l` → 要求输入密码（ocagent 无密码，无法提权）
 - [x] 验证 ClawShell 不可写: `sudo -u occlawshell touch /home/ocagent/.openclaw/workspace/test` → Permission denied
 
-### Phase 2: 运维打磨
-- [ ] /var/lib/occlawshell 磁盘配额限制
-- [ ] I/O 压力感知快照调度
+### Phase 2: 运维打磨 (2026-03-20)
+- [x] /var/lib/occlawshell 磁盘配额限制（quota-check.sh，默认 2GB，超限时自动裁剪 + 告警）
+- [x] I/O 压力感知快照调度（io-pressure-check.sh，PSI avg10 > 25% 时延迟快照，30s 重试）
 
 ### Phase 3: 高级防御
 - [ ] inotify 监控核心配置变更并自动告警

@@ -84,6 +84,9 @@ occlawshell  — Runs ClawShell, limited sudo (nologin system user)
 | `scripts/postmortem-collect.sh` | Crash forensics (14 /proc categories + dmesg + coredump) |
 | `scripts/auto-recover.sh` | Automated LKG recovery triggered by clawshell.py |
 | `scripts/pre-start-check.sh` | Blocks gateway start if SQLite missing/corrupted |
+| `scripts/quota-check.sh` | Vault disk quota check with emergency pruning |
+| `scripts/io-pressure-check.sh` | PSI-based I/O pressure gate with retry |
+| `scripts/migrate-to-ocagent.sh` | Data migration from yimeng to ocagent |
 | `systemd/oc-clawshell.service` | Watchdog daemon (Type=notify, WatchdogSec=120, OOMScoreAdjust=-500) |
 | `systemd/oc-snapshot.timer/service` | 30-min snapshot trigger (sqlite + files) |
 | `systemd/oc-healthcheck.timer/service` | 2-min health check trigger |
@@ -100,5 +103,7 @@ Environment variables in `/var/lib/occlawshell/config/clawshell.env`:
 - `MIN_UPTIME_SEC` (default: 1800) — Min uptime before LKG promotion
 - `AGENT_USER` (default: ocagent) — User running OpenClaw
 - `OPENCLAW_DIR` (default: /home/ocagent/.openclaw) — OpenClaw data directory
+- `MAX_VAULT_MB` (default: 2048) — Maximum vault disk usage in MB before snapshots are deferred
+- `IO_PRESSURE_THRESHOLD` (default: 25) — Max I/O PSI avg10 percentage before deferring snapshots
 
 Key thresholds in `clawshell.py`: `COLLECT_INTERVAL=30s`, `HANG_WARN_SECS=120`, `HANG_CRIT_SECS=300`, `IO_DELTA_THRESHOLD=1MB`, `CTX_SWITCH_THRESHOLD=10`, `RESTART_SETTLE_WAIT=90s` (wait before escalating to LKG recovery), `RECOVERY_COOLDOWN=1800s` (30-min cooldown between recovery attempts).
