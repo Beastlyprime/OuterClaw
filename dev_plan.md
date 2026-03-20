@@ -32,7 +32,7 @@ ClawShell 只做 OpenClaw 不可能自己做的事：
 ## 3. 三根支柱: Watch / Vault / Alert
 
 ### 3.1 WATCH: clawshell.py (常驻守护进程)
-- 纯 Python stdlib, ~250 行, 零外部依赖
+- 纯 Python stdlib, ~460 行, 零外部依赖
 - /proc 采集 (每30s)
 - HTTP :18789/health 探活
 - 6 态状态机: UNKNOWN → HEALTHY → HEAVY_INFERENCE → POSSIBLE_HANG → CONFIRMED_HANG / ZOMBIE / DOWN
@@ -54,7 +54,7 @@ ClawShell 只做 OpenClaw 不可能自己做的事：
 ## 4. 纵深防御架构 (Defense-in-Depth)
 
 ### Layer 0: Fortress (系统级加固)
-- **三用户隔离**: yimeng (人类管理员, 有 sudo) / ocagent (运行 OpenClaw, 无 sudo) / occlawshell (运行 ClawShell, 无 sudo)
+- **三用户隔离**: yimeng (人类管理员, 有 sudo) / ocagent (运行 OpenClaw, 无 sudo) / occlawshell (运行 ClawShell, 限定 sudo: 仅 restart gateway + auto-recover)
 - **文件不可变**: chattr +i 保护身份文件 SOUL.md, AGENTS.md, USER.md（运行时配置 openclaw.json 不锁定）
 - **systemd 沙箱**: NoNewPrivileges, ProtectSystem=strict, SystemCallFilter=@system-service
 - **ClawShell 自保**: OOMScoreAdjust=-500, WatchdogSec=120, StartLimitBurst=10
@@ -95,19 +95,32 @@ ClawShell 只做 OpenClaw 不可能自己做的事：
   - [x] oc-clawshell.service StartLimit 防无限重启
   - [x] .gitignore 扩展追踪所有项目文件
 
-### Phase 1: 部署验证
-- [ ] 执行 `deploy.sh` 完成全量部署
-- [ ] 验证隔离: `sudo -u ocagent ls /var/lib/occlawshell/` → Permission denied
-- [ ] 验证无 sudo: `sudo -u ocagent sudo -l` → no sudo privileges
-- [ ] 验证不可变: `echo x >> SOUL.md` → Operation not permitted
-- [ ] 验证 ClawShell 不可写: `sudo -u occlawshell touch /home/ocagent/.openclaw/workspace/test` → Permission denied
-- [ ] 验证 ClawShell: `journalctl -u oc-clawshell -f` → 每 30s /proc 采集
+### Phase 1: 部署与 ocagent 迁移 (2026-03-18)
+- [x] 创建 ocagent 用户，安装 OpenClaw
+- [x] 迁移数据：记忆、身份、credentials、config（migrate-to-ocagent.sh）
+- [x] 修复 openclaw.json 路径（/home/yimeng/ → /home/ocagent/）
+- [x] 安装全局 Node.js（NodeSource v24），解决 ocagent 无 nvm 问题
+- [x] 执行 `deploy.sh` 完成全量部署（创建 occlawshell 用户 + vault + ACL + sudoers）
+- [x] 手动创建 `start-gateway.sh`（deploy.sh 未检测到 ocagent 的 openclaw 路径，已修复）
+- [x] 迁移 gateway 到系统服务（User=ocagent，替代 yimeng 用户服务）
+- [x] 修复 vault 目录权限（0711 → 0700）和 ACL（occlawshell 读取 ocagent 数据）
+- [x] 修复 oc-clawshell.service（StartLimitIntervalSec 移至 [Unit] 段）
+- [x] 修复 snapshot-sqlite.sh pipefail 问题（ls glob 空匹配 + set -e 导致脚本退出）
+- [x] 验证 oc-clawshell.service 运行正常
+- [x] 验证 oc-snapshot/oc-healthcheck/oc-lkg-promote 定时器正常
+- [x] 验证 gateway 系统服务运行正常（ocagent doctor 通过，Telegram 连接正常）
+- [x] 修复 clawshell.py sd_notify 子进程继承警告（pop NOTIFY_SOCKET from env）
 
-### Phase 2: 运维打磨 (Week 2)
+### Phase 1b: 待验证安全项
+- [x] 验证隔离: `sudo -u ocagent ls /var/lib/occlawshell/` → Permission denied
+- [x] 验证无 sudo: `sudo -u ocagent sudo -l` → 要求输入密码（ocagent 无密码，无法提权）
+- [x] 验证 ClawShell 不可写: `sudo -u occlawshell touch /home/ocagent/.openclaw/workspace/test` → Permission denied
+
+### Phase 2: 运维打磨
 - [ ] /var/lib/occlawshell 磁盘配额限制
 - [ ] I/O 压力感知快照调度
 
-### Phase 3: 高级防御 (Week 3+)
+### Phase 3: 高级防御
 - [ ] inotify 监控核心配置变更并自动告警
 - [ ] Telegram bot 双向交互（远程审批 / 远程回滚）
 
@@ -115,19 +128,27 @@ ClawShell 只做 OpenClaw 不可能自己做的事：
 
 | 文件 | 状态 | 说明 |
 |------|------|------|
-| ~~`exec-approvals.json`~~ | 已移出 | 由 OpenClaw 自行管理，不属于 Guardian |
-| `clawshell.py` | 新 | 外部 watchdog, ~250 行 |
-| `deploy.sh` | 更新 | +clawshell.py +logrotate 部署 |
-| `logrotate/occlawshell` | 新 | 审计日志轮转 |
-| `systemd/oc-clawshell.service` | 更新 | +StartLimit |
-| `systemd/oc-lkg-promote.timer` | 新 | 每2h LKG 提升 |
-| `systemd/oc-lkg-promote.service` | 新 | promote-lkg.sh runner |
-| `scripts/*.sh` (7个) | 不变 | production-ready |
+| `clawshell.py` | 更新 | 外部 watchdog, ~460 行, 自动恢复 + sd_notify 修复 |
+| `deploy.sh` | 更新 | ocagent 路径检测 + home 目录 ACL |
+| `scripts/snapshot-sqlite.sh` | 修复 | pipefail glob 空匹配问题 |
+| `scripts/snapshot-files.sh` | 修复 | 同上 |
+| `scripts/promote-lkg.sh` | 修复 | 同上 |
+| `scripts/migrate-to-ocagent.sh` | 新 | 数据迁移 + 路径自动修复 |
+| `scripts/auto-recover.sh` | 不变 | 自动 LKG 恢复 |
+| `scripts/pre-start-check.sh` | 不变 | 启动前 SQLite 校验 |
+| `scripts/alert.sh` | 不变 | 独立告警通道 |
+| `scripts/healthcheck.sh` | 不变 | 4 因子健康检查 |
+| `scripts/rollback.sh` | 不变 | 人工回滚 |
+| `scripts/postmortem-collect.sh` | 不变 | 崩溃取证 |
+| `logrotate/occlawshell` | 不变 | 审计日志轮转 |
+| `systemd/oc-clawshell.service` | 修复 | StartLimit 移至 [Unit] 段 |
+| `systemd/oc-lkg-promote.*` | 不变 | 每2h LKG 提升 |
 | `systemd/oc-snapshot.*` | 不变 | 快照调度 |
 | `systemd/oc-healthcheck.*` | 不变 | 健康检查调度 |
-| `systemd/openclaw-gateway.service` | 不变 | Gateway 服务 |
+| `systemd/openclaw-gateway.service` | 不变 | Gateway 系统服务 (User=ocagent) |
 
 *v4.2 implementation completed 2026-02-18*
+*v4.2.1 deployment + ocagent migration completed 2026-03-18*
 
 ## 8. 攻击场景分析
 

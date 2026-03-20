@@ -109,11 +109,16 @@ class ProcessMetrics:
 
 # ── Helper Functions ───────────────────────────────────────────
 
+# Pop NOTIFY_SOCKET from env so subprocesses don't inherit it
+# (prevents "reception only permitted for main PID" warnings)
+_NOTIFY_SOCKET = os.environ.pop("NOTIFY_SOCKET", None)
+
+
 def sd_notify(state: str) -> None:
     """Send notification to systemd via NOTIFY_SOCKET."""
-    addr = os.environ.get("NOTIFY_SOCKET")
-    if not addr:
+    if not _NOTIFY_SOCKET:
         return
+    addr = _NOTIFY_SOCKET
     if addr[0] == "@":
         addr = "\0" + addr[1:]
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
