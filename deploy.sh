@@ -154,6 +154,12 @@ fi
 # OpenClaw root directory — default ACL for config files (openclaw.json, .env, etc.)
 setfacl -m u:occlawshell:rX "${OPENCLAW_DIR}"
 setfacl -d -m u:occlawshell:r "${OPENCLAW_DIR}"
+# Existing config files need explicit ACL (default ACL only applies to new files)
+for cfg in "${OPENCLAW_DIR}/openclaw.json" "${OPENCLAW_DIR}/.env"; do
+    if [[ -f "$cfg" ]]; then
+        setfacl -m u:occlawshell:r "$cfg"
+    fi
+done
 echo "  ✓ Config ACL set (with default ACL for new files)"
 
 # Logs
