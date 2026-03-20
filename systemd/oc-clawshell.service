@@ -32,7 +32,10 @@ CPUQuota=10%
 TasksMax=32
 
 # Security hardening
-NoNewPrivileges=yes
+# NoNewPrivileges must be off — ClawShell needs sudo for:
+#   systemctl restart, auto-recover.sh, identity-lock.sh
+# Sudo scope is restricted via /etc/sudoers.d/occlawshell
+NoNewPrivileges=no
 PrivateTmp=yes
 ProtectSystem=strict
 ProtectHome=read-only
