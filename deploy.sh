@@ -231,10 +231,11 @@ echo "Phase 5b: Sudoers for Auto-Recovery"
 echo "────────────────────────────────────"
 SUDOERS_FILE="/etc/sudoers.d/occlawshell"
 cat > "$SUDOERS_FILE" << 'SUDEOF'
-# ClawShell auto-recovery: allow occlawshell to restart gateway and run recovery
-# These are the ONLY privileged operations ClawShell can perform
+# ClawShell: narrowly scoped privileged operations
+# restart gateway, auto-recover from LKG, lock/unlock identity files
 occlawshell ALL=(root) NOPASSWD: /usr/bin/systemctl restart openclaw-gateway.service
 occlawshell ALL=(root) NOPASSWD: /var/lib/occlawshell/bin/auto-recover.sh
+occlawshell ALL=(root) NOPASSWD: /var/lib/occlawshell/bin/identity-lock.sh
 SUDEOF
 chmod 440 "$SUDOERS_FILE"
 if visudo -c -f "$SUDOERS_FILE" >/dev/null 2>&1; then

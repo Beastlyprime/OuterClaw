@@ -59,6 +59,9 @@ AUTO_RECOVER_SCRIPT = "/var/lib/occlawshell/bin/auto-recover.sh"
 RESTART_SETTLE_WAIT = 90   # Seconds to wait after restart before trying LKG recovery
 RECOVERY_COOLDOWN = 1800   # Don't retry recovery for 30 minutes after an attempt
 
+IDENTITY_LOCK_SCRIPT = "/var/lib/occlawshell/bin/identity-lock.sh"
+IDENTITY_UNLOCK_TIMEOUT = 600  # 10 minutes auto-relock
+
 # Config file monitoring
 OPENCLAW_DIR = os.environ.get("OPENCLAW_DIR", "/home/ocagent/.openclaw")
 WATCHED_FILES = [
@@ -477,6 +480,8 @@ class TelegramBot:
                 "`/status` — Gateway state & metrics\n"
                 "`/restart` — Restart gateway service\n"
                 "`/snapshots` — List recent snapshots\n"
+                "`/unlock_identity` — Unlock identity files (10 min timeout)\n"
+                "`/lock_identity` — Lock identity files\n"
                 "`/help` — This help message")
         elif cmd == "/status":
             s = self._get_status()
@@ -493,6 +498,12 @@ class TelegramBot:
             self._queue.put({"action": "restart", "user": username})
         elif cmd == "/snapshots":
             self._cmd_snapshots()
+        elif cmd == "/unlock_identity":
+            self.send_message(
+                f"Unlocking identity files (requested by {username})...")
+            self._queue.put({"action": "unlock_identity", "user": username})
+        elif cmd == "/lock_identity":
+            self._queue.put({"action": "lock_identity", "user": username})
         else:
             self.send_message(
                 f"Unknown command: `{cmd}`\nUse /help for available commands.")
@@ -539,6 +550,9 @@ class ClawShell:
         # Telegram bot (two-way)
         self._tg_command_queue: queue.Queue = queue.Queue()
         self._tg_bot: Optional[TelegramBot] = None
+
+        # Identity unlock tracking
+        self._identity_unlocked_at: Optional[float] = None
 
         signal.signal(signal.SIGTERM, self._handle_signal)
         signal.signal(signal.SIGINT, self._handle_signal)
@@ -727,6 +741,52 @@ class ClawShell:
             ).strftime("%H:%M:%S UTC") if self.last_collect else "never",
         }
 
+    def _identity_unlock(self, source: str = "CLI") -> str:
+        """Unlock identity files. Returns status message."""
+        try:
+            result = subprocess.run(
+                ["sudo", IDENTITY_LOCK_SCRIPT, "unlock"],
+                timeout=10, capture_output=True, text=True,
+            )
+            if result.returncode == 0:
+                self._identity_unlocked_at = time.time()
+                msg = (f"Identity files UNLOCKED ({source}). "
+                       f"Auto-relock in {IDENTITY_UNLOCK_TIMEOUT // 60} minutes.")
+                logging.warning(msg)
+                send_alert("WARNING", msg)
+                return result.stdout.strip() + f"\n\nAuto-relock in {IDENTITY_UNLOCK_TIMEOUT // 60} min."
+            return f"Unlock failed: {result.stderr[:200]}"
+        except (subprocess.TimeoutExpired, OSError) as e:
+            return f"Unlock error: {e}"
+
+    def _identity_lock(self, source: str = "CLI") -> str:
+        """Lock identity files. Returns status message."""
+        try:
+            result = subprocess.run(
+                ["sudo", IDENTITY_LOCK_SCRIPT, "lock"],
+                timeout=10, capture_output=True, text=True,
+            )
+            if result.returncode == 0:
+                self._identity_unlocked_at = None
+                msg = f"Identity files LOCKED ({source})."
+                logging.info(msg)
+                send_alert("INFO", msg)
+                return result.stdout.strip()
+            return f"Lock failed: {result.stderr[:200]}"
+        except (subprocess.TimeoutExpired, OSError) as e:
+            return f"Lock error: {e}"
+
+    def _check_identity_timeout(self) -> None:
+        """Auto-relock identity files after timeout."""
+        if (self._identity_unlocked_at is not None
+                and time.time() - self._identity_unlocked_at
+                > IDENTITY_UNLOCK_TIMEOUT):
+            logging.warning("Identity unlock timeout — auto-relocking")
+            self._identity_lock(source="auto-timeout")
+            if self._tg_bot:
+                self._tg_bot.send_message(
+                    "Identity files auto-relocked (10 min timeout).")
+
     def _process_tg_commands(self) -> None:
         """Process commands queued by TelegramBot thread."""
         while not self._tg_command_queue.empty():
@@ -751,6 +811,16 @@ class ClawShell:
                            else f"Restart failed: {result.stderr[:200]}")
                 except (subprocess.TimeoutExpired, OSError) as e:
                     msg = f"Restart error: {e}"
+                if self._tg_bot:
+                    self._tg_bot.send_message(msg)
+
+            elif action == "unlock_identity":
+                msg = self._identity_unlock(source=f"Telegram/{user}")
+                if self._tg_bot:
+                    self._tg_bot.send_message(msg)
+
+            elif action == "lock_identity":
+                msg = self._identity_lock(source=f"Telegram/{user}")
                 if self._tg_bot:
                     self._tg_bot.send_message(msg)
 
@@ -819,6 +889,9 @@ class ClawShell:
 
             # Telegram command processing
             self._process_tg_commands()
+
+            # Auto-relock identity files after timeout
+            self._check_identity_timeout()
 
             time.sleep(TICK_INTERVAL)
 
@@ -1040,6 +1113,19 @@ def show_status() -> None:
 
 # ── Entry Point ────────────────────────────────────────────────
 
+def _run_identity_cmd(action: str) -> None:
+    """Run identity lock/unlock via sudo."""
+    try:
+        result = subprocess.run(
+            ["sudo", IDENTITY_LOCK_SCRIPT, action],
+            timeout=10, text=True,
+        )
+        sys.exit(result.returncode)
+    except (subprocess.TimeoutExpired, OSError) as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+
 def main():
     if "--status" in sys.argv:
         show_status()
@@ -1049,6 +1135,12 @@ def main():
         return
     if "--help" in sys.argv or "-h" in sys.argv:
         print(__doc__)
+        return
+    if "--unlock-identity" in sys.argv:
+        _run_identity_cmd("unlock")
+        return
+    if "--lock-identity" in sys.argv:
+        _run_identity_cmd("lock")
         return
 
     logging.basicConfig(
