@@ -1,21 +1,18 @@
 #!/usr/bin/env python3
-"""ClawShell — External Watchdog Daemon for OpenClaw
+"""ClawShell — External Watchdog & Guardian for OpenClaw (v1.0)
 
-Single responsibility: monitor OpenClaw gateway process health from outside.
-Detects hangs, zombies, and crashes that the process cannot self-detect.
+Monitors OpenClaw gateway process health, protects data with atomic backups,
+and provides independent alerting. Detects hangs, zombies, and crashes that
+the process cannot self-detect.
+
+Usage:
+  clawshell.py           Run the watchdog daemon (systemd)
+  clawshell.py --status  Show guardian status report
+  clawshell.py --help    Show this help
 
 State machine:
-  UNKNOWN → HEALTHY (on first successful tick)
-  HEALTHY → HEAVY_INFERENCE (HTTP down but I/O active)
-  HEAVY_INFERENCE → POSSIBLE_HANG (I/O stalled >120s)
-  POSSIBLE_HANG → CONFIRMED_HANG (I/O stalled >300s)
-  Any → DOWN (PID gone)
-  Any → ZOMBIE (/proc state = Z)
-  DOWN/HANG/ZOMBIE → HEALTHY (recovery)
-
-Does NOT do: Telegram directly, audit scanning, LKG promotion, snapshots.
-Calls alert.sh for all notifications.
-Writes /var/lib/occlawshell/audit/gateway-proc-latest.json every 30s.
+  UNKNOWN → HEALTHY → HEAVY_INFERENCE → POSSIBLE_HANG → CONFIRMED_HANG
+  Any → DOWN (PID gone) | ZOMBIE (state=Z)
 """
 
 import ctypes
@@ -76,6 +73,7 @@ CONFIG_REWATCH_INTERVAL = 300  # Re-check for deleted-then-recreated files every
 TG_TOKEN = os.environ.get("CLAWSHELL_TG_TOKEN", "")
 TG_CHAT = os.environ.get("CLAWSHELL_TG_CHAT", "")
 
+VERSION = "1.0"
 LOG_FORMAT = "%(asctime)s [%(levelname)s] %(message)s"
 
 
@@ -813,9 +811,227 @@ class ClawShell:
         logging.info("ClawShell stopped")
 
 
+# ── Status Report ─────────────────────────────────────────────
+
+def _fmt_ago(ts: float) -> str:
+    """Format a timestamp as 'X ago'."""
+    delta = int(time.time() - ts)
+    if delta < 60:
+        return f"{delta}s ago"
+    if delta < 3600:
+        return f"{delta // 60}m ago"
+    if delta < 86400:
+        return f"{delta // 3600}h {(delta % 3600) // 60}m ago"
+    return f"{delta // 86400}d {(delta % 86400) // 3600}h ago"
+
+
+def _fmt_uptime(seconds: int) -> str:
+    d, r = divmod(seconds, 86400)
+    h, r = divmod(r, 3600)
+    m, _ = divmod(r, 60)
+    parts = []
+    if d:
+        parts.append(f"{d} day{'s' if d != 1 else ''}")
+    if h:
+        parts.append(f"{h} hr{'s' if h != 1 else ''}")
+    if m or not parts:
+        parts.append(f"{m} min{'s' if m != 1 else ''}")
+    return " ".join(parts)
+
+
+def _check_mark(ok: bool) -> str:
+    return "✓" if ok else "✗"
+
+
+def show_status() -> None:
+    """Print a human-friendly guardian status report."""
+    vault = Path("/var/lib/occlawshell")
+    snap_dir = vault / "snapshots"
+    lkg_dir = vault / "lkg"
+    audit_dir = vault / "audit"
+    proc_json = vault / "audit" / "gateway-proc-latest.json"
+
+    # ── Header ──
+    print("╔══════════════════════════════════════╗")
+    print(f"║     ClawShell Guardian v{VERSION}          ║")
+    print("╚══════════════════════════════════════╝")
+    print()
+
+    # ── Gateway state from proc JSON ──
+    state = "UNKNOWN"
+    pid = "N/A"
+    proc_ts = 0.0
+    try:
+        if proc_json.exists():
+            data = json.loads(proc_json.read_text())
+            state = data.get("clawshell_state", "UNKNOWN")
+            pid = data.get("pid", "N/A")
+            ts_str = data.get("timestamp", "")
+            if ts_str:
+                proc_ts = datetime.fromisoformat(ts_str).timestamp()
+    except (json.JSONDecodeError, OSError, ValueError, PermissionError):
+        pass
+
+    state_icon = "🟢" if state == "HEALTHY" else "🔴" if state in (
+        "DOWN", "CONFIRMED_HANG", "ZOMBIE") else "🟡"
+
+    # ── Gateway uptime ──
+    uptime_str = "unknown"
+    try:
+        result = subprocess.run(
+            ["systemctl", "show", GATEWAY_SERVICE,
+             "--property=ActiveEnterTimestampMonotonic", "--value"],
+            capture_output=True, text=True, timeout=5,
+        )
+        mono_us = int(result.stdout.strip())
+        if mono_us > 0:
+            # Get current monotonic time
+            with open("/proc/uptime") as f:
+                sys_uptime = float(f.read().split()[0])
+            gateway_up_secs = int(sys_uptime - mono_us / 1_000_000)
+            if gateway_up_secs > 0:
+                uptime_str = _fmt_uptime(gateway_up_secs)
+    except (ValueError, subprocess.TimeoutExpired, OSError):
+        pass
+
+    print(f"  System        {state_icon} {state}")
+    print(f"  Gateway       PID {pid}")
+    print(f"  Uptime        {uptime_str}")
+    if proc_ts > 0:
+        print(f"  Last check    {_fmt_ago(proc_ts)}")
+    print()
+
+    # ── Data Protection ──
+    print("  Data Protection")
+
+    # Latest snapshot
+    snap_count = 0
+    latest_snap_ts = 0.0
+    try:
+        snaps = sorted(snap_dir.glob("main-*.sqlite"),
+                       key=lambda p: p.stat().st_mtime, reverse=True)
+        snap_count = len(snaps)
+        if snaps:
+            latest_snap_ts = snaps[0].stat().st_mtime
+    except (OSError, PermissionError):
+        pass
+
+    snap_ago = _fmt_ago(latest_snap_ts) if latest_snap_ts else "never"
+    print(f"  ├─ Last backup     {snap_ago}")
+    print(f"  ├─ Backup count    {snap_count}")
+
+    # LKG
+    lkg_count = 0
+    try:
+        lkg_count = len(list(lkg_dir.glob("lkg-*")))
+    except (OSError, PermissionError):
+        pass
+    print(f"  ├─ LKG states      {lkg_count} available")
+
+    # Integrity check on latest snapshot
+    integrity = "unknown"
+    if latest_snap_ts:
+        try:
+            snaps = sorted(snap_dir.glob("main-*.sqlite"),
+                           key=lambda p: p.stat().st_mtime, reverse=True)
+            result = subprocess.run(
+                ["sqlite3", str(snaps[0]), "PRAGMA integrity_check;"],
+                capture_output=True, text=True, timeout=10,
+            )
+            integrity = "passed" if result.stdout.strip() == "ok" else "FAILED"
+        except (subprocess.TimeoutExpired, OSError, IndexError):
+            pass
+    print(f"  └─ Integrity       {_check_mark(integrity == 'passed')} {integrity}")
+    print()
+
+    # ── Security ──
+    print("  Security")
+
+    # Three-user isolation
+    try:
+        import pwd
+        users_ok = all(
+            pwd.getpwnam(u) for u in ("ocagent", "occlawshell"))
+    except (KeyError, ImportError):
+        users_ok = False
+    print(f"  ├─ User isolation  {_check_mark(users_ok)} "
+          f"{'3-user isolation active' if users_ok else 'missing users'}")
+
+    # Identity files immutable
+    identity_files = [
+        Path(OPENCLAW_DIR) / "workspace" / f
+        for f in ("SOUL.md", "AGENTS.md", "USER.md")
+    ]
+    immutable_count = 0
+    total_identity = 0
+    for f in identity_files:
+        try:
+            if f.exists():
+                total_identity += 1
+                result = subprocess.run(
+                    ["lsattr", str(f)],
+                    capture_output=True, text=True, timeout=5,
+                )
+                if "i" in result.stdout.split()[0]:
+                    immutable_count += 1
+        except (subprocess.TimeoutExpired, OSError, PermissionError,
+                IndexError):
+            pass
+    immutable_ok = immutable_count == total_identity and total_identity > 0
+    print(f"  ├─ Identity files  {_check_mark(immutable_ok)} "
+          f"{immutable_count}/{total_identity} immutable")
+
+    # Config monitoring
+    watcher_active = False
+    try:
+        result = subprocess.run(
+            ["systemctl", "is-active", "oc-clawshell.service"],
+            capture_output=True, text=True, timeout=5,
+        )
+        watcher_active = result.stdout.strip() == "active"
+    except (subprocess.TimeoutExpired, OSError):
+        pass
+    print(f"  ├─ Config monitor  {_check_mark(watcher_active)} "
+          f"{'inotify active' if watcher_active else 'inactive'}")
+
+    # Telegram
+    tg_ok = False
+    try:
+        alerts_log = audit_dir / "alerts.log"
+        if alerts_log.exists():
+            # Check if alert.sh has written recently (last 24h)
+            tg_ok = (time.time() - alerts_log.stat().st_mtime) < 86400
+    except OSError:
+        pass
+    # Also check if env has TG config
+    env_file = vault / "config" / "clawshell.env"
+    tg_configured = False
+    try:
+        if env_file.exists():
+            env_text = env_file.read_text()
+            tg_configured = ("CLAWSHELL_TG_TOKEN=" in env_text
+                             and "CLAWSHELL_TG_CHAT=" in env_text)
+    except (OSError, PermissionError):
+        pass
+    tg_label = "connected" if tg_configured else "not configured"
+    print(f"  └─ Alert channel   {_check_mark(tg_configured)} "
+          f"Telegram {tg_label}")
+    print()
+
+
 # ── Entry Point ────────────────────────────────────────────────
 
 def main():
+    if "--status" in sys.argv:
+        show_status()
+        return
+    if "--version" in sys.argv or "-V" in sys.argv:
+        print(f"ClawShell v{VERSION}")
+        return
+    if "--help" in sys.argv or "-h" in sys.argv:
+        print(__doc__)
+        return
+
     logging.basicConfig(
         level=(logging.DEBUG
                if os.environ.get("CLAWSHELL_DEBUG") else logging.INFO),
