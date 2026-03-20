@@ -742,11 +742,11 @@ class ClawShell:
         }
 
     def _identity_unlock(self, source: str = "CLI") -> str:
-        """Unlock identity files. Returns status message."""
+        """Unlock identity files via systemd oneshot (escapes sandbox)."""
         try:
             result = subprocess.run(
-                ["sudo", IDENTITY_LOCK_SCRIPT, "unlock"],
-                timeout=10, capture_output=True, text=True,
+                ["sudo", "systemctl", "start", "oc-identity-unlock.service"],
+                timeout=15, capture_output=True, text=True,
             )
             if result.returncode == 0:
                 self._identity_unlocked_at = time.time()
@@ -754,24 +754,24 @@ class ClawShell:
                        f"Auto-relock in {IDENTITY_UNLOCK_TIMEOUT // 60} minutes.")
                 logging.warning(msg)
                 send_alert("WARNING", msg)
-                return result.stdout.strip() + f"\n\nAuto-relock in {IDENTITY_UNLOCK_TIMEOUT // 60} min."
+                return msg
             return f"Unlock failed: {result.stderr[:200]}"
         except (subprocess.TimeoutExpired, OSError) as e:
             return f"Unlock error: {e}"
 
     def _identity_lock(self, source: str = "CLI") -> str:
-        """Lock identity files. Returns status message."""
+        """Lock identity files via systemd oneshot (escapes sandbox)."""
         try:
             result = subprocess.run(
-                ["sudo", IDENTITY_LOCK_SCRIPT, "lock"],
-                timeout=10, capture_output=True, text=True,
+                ["sudo", "systemctl", "start", "oc-identity-lock.service"],
+                timeout=15, capture_output=True, text=True,
             )
             if result.returncode == 0:
                 self._identity_unlocked_at = None
                 msg = f"Identity files LOCKED ({source})."
                 logging.info(msg)
                 send_alert("INFO", msg)
-                return result.stdout.strip()
+                return msg
             return f"Lock failed: {result.stderr[:200]}"
         except (subprocess.TimeoutExpired, OSError) as e:
             return f"Lock error: {e}"

@@ -1,0 +1,9 @@
+# /etc/systemd/system/oc-identity-unlock.service
+# Oneshot: unlock identity files (runs outside ClawShell's sandbox)
+[Unit]
+Description=ClawShell Identity Unlock
+
+[Service]
+Type=oneshot
+ExecStart=/var/lib/occlawshell/bin/identity-lock.sh unlock
+RemainAfterExit=no

@@ -37,9 +37,17 @@ for f in "${IDENTITY_FILES[@]}"; do
         continue
     fi
     if [[ "$ACTION" == "lock" ]]; then
-        chattr +i "$f" 2>/dev/null && echo "  LOCKED: $(basename "$f")" || echo "  FAIL: $(basename "$f")"
+        if chattr +i "$f" 2>&1; then
+            echo "  LOCKED: $(basename "$f")"
+        else
+            echo "  FAIL: $(basename "$f") — chattr +i error on $f"
+        fi
     else
-        chattr -i "$f" 2>/dev/null && echo "  UNLOCKED: $(basename "$f")" || echo "  FAIL: $(basename "$f")"
+        if chattr -i "$f" 2>&1; then
+            echo "  UNLOCKED: $(basename "$f")"
+        else
+            echo "  FAIL: $(basename "$f") — chattr -i error on $f"
+        fi
     fi
 done
 
