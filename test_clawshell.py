@@ -1,0 +1,380 @@
+import unittest
+import os
+import struct
+import sys
+import json
+import time
+import signal
+import logging
+import tempfile
+import subprocess
+from unittest.mock import MagicMock, patch, Mock, call
+
+# Add the directory to sys.path to import clawshell
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+import clawshell
+from clawshell import (
+    State, ProcessMetrics, ClawShell, find_gateway_pid, collect_proc,
+    check_health, send_alert, write_proc_json, sd_notify,
+    ConfigWatcher, TelegramBot,
+)
+
+# ── ProcessMetrics and Enum Tests ──────────────────────────────
+
+class TestBasicStructures(unittest.TestCase):
+    def test_state_enum(self):
+        self.assertEqual(State.UNKNOWN.value, "UNKNOWN")
+        self.assertEqual(State.HEALTHY.value, "HEALTHY")
+        self.assertEqual(State.DOWN.value, "DOWN")
+
+    def test_metrics_defaults(self):
+        m = ProcessMetrics()
+        self.assertEqual(m.pid, 0)
+        self.assertEqual(m.rss_bytes, 0)
+        self.assertEqual(m.fd_count, 0)
+
+    def test_metrics_to_dict(self):
+        m = ProcessMetrics()
+        m.pid = 123
+        m.state = "S"
+        d = m.to_dict()
+        self.assertEqual(d["pid"], 123)
+        self.assertEqual(d["proc_state"], "S")
+
+
+# ── collect_proc Tests ────────────────────────────────────────
+
+class TestCollectProc(unittest.TestCase):
+    def _make_status(self, state="S", threads=4, rss_kb=50000,
+                     vol_ctx=100, nonvol_ctx=20):
+        return (
+            f"Name:\tpython3\n"
+            f"State:\t{state} (sleeping)\n"
+            f"Threads:\t{threads}\n"
+            f"VmRSS:\t{rss_kb} kB\n"
+            f"voluntary_ctxt_switches:\t{vol_ctx}\n"
+            f"nonvoluntary_ctxt_switches:\t{nonvol_ctx}\n"
+        )
+
+    def _make_io(self, read_bytes=1000, write_bytes=2000):
+        return (
+            f"rchar: 999\n"
+            f"wchar: 999\n"
+            f"read_bytes: {read_bytes}\n"
+            f"write_bytes: {write_bytes}\n"
+        )
+
+    @patch("clawshell.Path")
+    def test_returns_none_when_proc_absent(self, mock_path):
+        mock_path.return_value.exists.return_value = False
+        result = collect_proc(999)
+        self.assertIsNone(result)
+
+    @patch("clawshell.Path")
+    def test_collects_all_fields(self, mock_path):
+        proc_path = MagicMock()
+        mock_path.return_value = proc_path
+        proc_path.exists.return_value = True
+
+        status_file = MagicMock()
+        status_file.read_text.return_value = self._make_status()
+
+        io_file = MagicMock()
+        io_file.read_text.return_value = self._make_io(5000, 3000)
+
+        fd_dir = MagicMock()
+        fd_dir.iterdir.return_value = [Mock()] * 10
+
+        def truediv(self_, name):
+            if name == "status":
+                return status_file
+            elif name == "io":
+                return io_file
+            elif name == "fd":
+                return fd_dir
+            return MagicMock()
+
+        proc_path.__truediv__ = truediv
+
+        result = collect_proc(1234)
+        self.assertIsNotNone(result)
+        self.assertEqual(result.pid, 1234)
+        self.assertEqual(result.state, "S")
+        self.assertEqual(result.threads, 4)
+        self.assertEqual(result.rss_bytes, 50000 * 1024)
+        self.assertEqual(result.voluntary_ctxt_switches, 100)
+        self.assertEqual(result.nonvoluntary_ctxt_switches, 20)
+        self.assertEqual(result.read_bytes, 5000)
+        self.assertEqual(result.write_bytes, 3000)
+        self.assertEqual(result.fd_count, 10)
+        self.assertGreater(result.timestamp, 0)
+
+# ── check_health Tests ────────────────────────────────────────
+
+class TestCheckHealth(unittest.TestCase):
+    @patch("clawshell.urlopen")
+    def test_returns_true_on_200(self, mock_urlopen):
+        mock_resp = MagicMock()
+        mock_resp.status = 200
+        mock_urlopen.return_value = mock_resp
+        self.assertTrue(check_health())
+
+    @patch("clawshell.urlopen")
+    def test_returns_false_on_exception(self, mock_urlopen):
+        mock_urlopen.side_effect = Exception("error")
+        self.assertFalse(check_health())
+
+# ── ClawShell._classify Tests ────────────────────────────────
+
+class TestClawShellClassify(unittest.TestCase):
+    def setUp(self):
+        with patch("signal.signal"):
+            self.g = ClawShell()
+
+    def test_none_metrics_returns_down(self):
+        result = self.g._classify(None, http_ok=False)
+        self.assertEqual(result, State.DOWN)
+
+    def test_http_ok_returns_healthy(self):
+        m = ProcessMetrics()
+        m.state = "S"
+        result = self.g._classify(m, http_ok=True)
+        self.assertEqual(result, State.HEALTHY)
+
+    def test_zombie_state(self):
+        m = ProcessMetrics()
+        m.state = "Z"
+        result = self.g._classify(m, http_ok=False)
+        self.assertEqual(result, State.ZOMBIE)
+
+# ── Integration Scenarios ─────────────────────────────────────
+
+class TestIntegration(unittest.TestCase):
+    def setUp(self):
+        with patch("signal.signal"):
+            self.g = ClawShell()
+
+    def test_stall_lifecycle(self):
+        prev = ProcessMetrics()
+        prev.pid = 100
+        self.g.prev_metrics = prev
+
+        curr = ProcessMetrics()
+        curr.pid = 100
+        curr.state = "S"
+
+        # First stall
+        s = self.g._classify(curr, http_ok=False)
+        self.assertEqual(s, State.HEAVY_INFERENCE)
+        self.assertIsNotNone(self.g.stall_since)
+
+        # Possible hang
+        self.g.stall_since = time.time() - (clawshell.HANG_WARN_SECS + 1)
+        s = self.g._classify(curr, http_ok=False)
+        self.assertEqual(s, State.POSSIBLE_HANG)
+
+        # Confirmed hang
+        self.g.stall_since = time.time() - (clawshell.HANG_CRIT_SECS + 1)
+        s = self.g._classify(curr, http_ok=False)
+        self.assertEqual(s, State.CONFIRMED_HANG)
+
+# ── ConfigWatcher Tests ───────────────────────────────────────
+
+class TestConfigWatcher(unittest.TestCase):
+    def test_describe_mask_modify(self):
+        self.assertIn("modified", ConfigWatcher._describe_mask(0x00000002))
+
+    def test_describe_mask_attrib(self):
+        self.assertIn("attributes changed",
+                      ConfigWatcher._describe_mask(0x00000004))
+
+    def test_describe_mask_delete(self):
+        self.assertIn("deleted", ConfigWatcher._describe_mask(0x00000400))
+
+    def test_describe_mask_combined(self):
+        desc = ConfigWatcher._describe_mask(0x00000002 | 0x00000004)
+        self.assertIn("modified", desc)
+        self.assertIn("attributes changed", desc)
+
+    def test_describe_mask_unknown(self):
+        desc = ConfigWatcher._describe_mask(0x01000000)
+        self.assertIn("0x1000000", desc)
+
+    def test_init_with_tempfile(self):
+        """ConfigWatcher can watch a real file."""
+        with tempfile.NamedTemporaryFile(suffix=".md", delete=False) as f:
+            path = f.name
+        try:
+            cw = ConfigWatcher([path])
+            self.assertIn(path, cw._wd_to_path.values())
+            cw.close()
+        finally:
+            os.unlink(path)
+
+    def test_init_skips_missing_files(self):
+        """ConfigWatcher skips files that don't exist."""
+        cw = ConfigWatcher(["/nonexistent/path/SOUL.md"])
+        self.assertEqual(len(cw._wd_to_path), 0)
+        cw.close()
+
+    @patch("clawshell.send_alert")
+    def test_process_events_with_modify(self, mock_alert):
+        """ConfigWatcher detects file modification."""
+        with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as f:
+            path = f.name
+        try:
+            cw = ConfigWatcher([path])
+            # Trigger a modify event
+            with open(path, "w") as f:
+                f.write("changed")
+            time.sleep(0.1)  # Let inotify process
+            cw.process_events()
+            if mock_alert.called:
+                mock_alert.assert_called_once()
+                args = mock_alert.call_args[0]
+                self.assertEqual(args[0], "WARNING")
+            cw.close()
+        finally:
+            os.unlink(path)
+
+    @patch("clawshell.send_alert")
+    def test_identity_file_gets_critical_alert(self, mock_alert):
+        """Identity files (SOUL.md etc) trigger CRITICAL alerts."""
+        with tempfile.NamedTemporaryFile(
+                prefix="SOUL", suffix=".md", delete=False,
+                dir="/tmp") as f:
+            path = f.name
+        # Rename to exactly SOUL.md
+        soul_path = os.path.join("/tmp", "SOUL.md")
+        os.rename(path, soul_path)
+        try:
+            cw = ConfigWatcher([soul_path])
+            with open(soul_path, "w") as f:
+                f.write("tampered")
+            time.sleep(0.1)
+            cw.process_events()
+            if mock_alert.called:
+                args = mock_alert.call_args[0]
+                self.assertEqual(args[0], "CRITICAL")
+                self.assertIn("TAMPERED", args[1])
+            cw.close()
+        finally:
+            os.unlink(soul_path)
+
+
+# ── TelegramBot Tests ────────────────────────────────────────
+
+class TestTelegramBot(unittest.TestCase):
+    def setUp(self):
+        import queue
+        self.cmd_queue = queue.Queue()
+        self.status_fn = lambda: {
+            "state": "HEALTHY", "pid": 123,
+            "uptime": "2h", "rss_mb": 400, "last_check": "12:00:00 UTC",
+        }
+        self.bot = TelegramBot(
+            "fake_token", "12345",
+            self.cmd_queue, self.status_fn,
+        )
+
+    def test_rejects_unauthorized_chat(self):
+        """Commands from wrong chat_id are rejected."""
+        update = {
+            "update_id": 1,
+            "message": {
+                "text": "/status",
+                "chat": {"id": 99999},
+                "from": {"username": "attacker"},
+            }
+        }
+        with patch.object(self.bot, "send_message") as mock_send:
+            self.bot._handle_update(update)
+            mock_send.assert_not_called()
+
+    def test_help_command(self):
+        update = {
+            "update_id": 1,
+            "message": {
+                "text": "/help",
+                "chat": {"id": 12345},
+                "from": {"username": "admin"},
+            }
+        }
+        with patch.object(self.bot, "send_message") as mock_send:
+            self.bot._handle_update(update)
+            mock_send.assert_called_once()
+            self.assertIn("Commands", mock_send.call_args[0][0])
+
+    def test_status_command(self):
+        update = {
+            "update_id": 2,
+            "message": {
+                "text": "/status",
+                "chat": {"id": 12345},
+                "from": {"username": "admin"},
+            }
+        }
+        with patch.object(self.bot, "send_message") as mock_send:
+            self.bot._handle_update(update)
+            mock_send.assert_called_once()
+            self.assertIn("HEALTHY", mock_send.call_args[0][0])
+
+    def test_restart_queues_command(self):
+        update = {
+            "update_id": 3,
+            "message": {
+                "text": "/restart",
+                "chat": {"id": 12345},
+                "from": {"username": "admin"},
+            }
+        }
+        with patch.object(self.bot, "send_message"):
+            self.bot._handle_update(update)
+            self.assertFalse(self.cmd_queue.empty())
+            cmd = self.cmd_queue.get_nowait()
+            self.assertEqual(cmd["action"], "restart")
+            self.assertEqual(cmd["user"], "admin")
+
+    def test_unknown_command(self):
+        update = {
+            "update_id": 4,
+            "message": {
+                "text": "/foo",
+                "chat": {"id": 12345},
+                "from": {"username": "admin"},
+            }
+        }
+        with patch.object(self.bot, "send_message") as mock_send:
+            self.bot._handle_update(update)
+            self.assertIn("Unknown", mock_send.call_args[0][0])
+
+    def test_ignores_non_command_messages(self):
+        update = {
+            "update_id": 5,
+            "message": {
+                "text": "hello",
+                "chat": {"id": 12345},
+                "from": {"username": "admin"},
+            }
+        }
+        with patch.object(self.bot, "send_message") as mock_send:
+            self.bot._handle_update(update)
+            mock_send.assert_not_called()
+
+    def test_strips_bot_mention_from_command(self):
+        update = {
+            "update_id": 6,
+            "message": {
+                "text": "/status@MyClawBot",
+                "chat": {"id": 12345},
+                "from": {"username": "admin"},
+            }
+        }
+        with patch.object(self.bot, "send_message") as mock_send:
+            self.bot._handle_update(update)
+            mock_send.assert_called_once()
+            self.assertIn("HEALTHY", mock_send.call_args[0][0])
+
+
+if __name__ == "__main__":
+    unittest.main()

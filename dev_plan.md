@@ -120,9 +120,9 @@ ClawShell 只做 OpenClaw 不可能自己做的事：
 - [x] /var/lib/occlawshell 磁盘配额限制（quota-check.sh，默认 2GB，超限时自动裁剪 + 告警）
 - [x] I/O 压力感知快照调度（io-pressure-check.sh，PSI avg10 > 25% 时延迟快照，30s 重试）
 
-### Phase 3: 高级防御
-- [ ] inotify 监控核心配置变更并自动告警
-- [ ] Telegram bot 双向交互（远程审批 / 远程回滚）
+### Phase 3: 高级防御 (2026-03-20)
+- [x] inotify 监控核心配置变更并自动告警（ConfigWatcher，ctypes 实现，零依赖，实时检测）
+- [x] Telegram bot 双向交互（TelegramBot，getUpdates 长轮询，支持 /status /restart /snapshots /help）
 
 ## 7. 文件清单
 

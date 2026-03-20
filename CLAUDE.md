@@ -33,7 +33,7 @@ tail -f /var/lib/occlawshell/audit/alerts.log
 ## Architecture: Three Pillars
 
 ### 1. WATCH — `clawshell.py`
-Pure Python (stdlib only) watchdog daemon (~460 lines). Collects `/proc` data every 30s, checks HTTP health at `:18789/health`, and classifies process state via a 6-state machine: `UNKNOWN → HEALTHY → HEAVY_INFERENCE → POSSIBLE_HANG → CONFIRMED_HANG / ZOMBIE / DOWN`. Sends `sd_notify()` heartbeat every 1s. Calls `alert.sh` on state transitions. Includes two-step auto-recovery: on `CONFIRMED_HANG`, restarts gateway; if still unhealthy after 90s, triggers LKG recovery via `auto-recover.sh` (30-min cooldown between attempts).
+Pure Python (stdlib only) watchdog daemon (~830 lines). Collects `/proc` data every 30s, checks HTTP health at `:18789/health`, and classifies process state via a 6-state machine: `UNKNOWN → HEALTHY → HEAVY_INFERENCE → POSSIBLE_HANG → CONFIRMED_HANG / ZOMBIE / DOWN`. Sends `sd_notify()` heartbeat every 1s. Calls `alert.sh` on state transitions. Includes two-step auto-recovery: on `CONFIRMED_HANG`, restarts gateway; if still unhealthy after 90s, triggers LKG recovery via `auto-recover.sh` (30-min cooldown between attempts). Monitors critical config files (SOUL.md, AGENTS.md, USER.md, openclaw.json) via inotify for tampering detection. Optionally runs a two-way Telegram bot for remote status queries and gateway restart.
 
 ### 2. VAULT — Snapshots & LKG
 Atomic backups stored in `/var/lib/occlawshell/` (owned by `occlawshell`, mode 0700):

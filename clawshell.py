@@ -18,13 +18,19 @@ Calls alert.sh for all notifications.
 Writes /var/lib/occlawshell/audit/gateway-proc-latest.json every 30s.
 """
 
+import ctypes
+import ctypes.util
 import json
 import logging
 import os
+import queue
+import select
 import signal
 import socket
+import struct
 import subprocess
 import sys
+import threading
 import time
 from datetime import datetime, timezone
 from enum import Enum
@@ -55,6 +61,20 @@ AUTO_RECOVER_SCRIPT = "/var/lib/occlawshell/bin/auto-recover.sh"
 
 RESTART_SETTLE_WAIT = 90   # Seconds to wait after restart before trying LKG recovery
 RECOVERY_COOLDOWN = 1800   # Don't retry recovery for 30 minutes after an attempt
+
+# Config file monitoring
+OPENCLAW_DIR = os.environ.get("OPENCLAW_DIR", "/home/ocagent/.openclaw")
+WATCHED_FILES = [
+    os.path.join(OPENCLAW_DIR, "workspace", "SOUL.md"),
+    os.path.join(OPENCLAW_DIR, "workspace", "AGENTS.md"),
+    os.path.join(OPENCLAW_DIR, "workspace", "USER.md"),
+    os.path.join(OPENCLAW_DIR, "openclaw.json"),
+]
+CONFIG_REWATCH_INTERVAL = 300  # Re-check for deleted-then-recreated files every 5 min
+
+# Telegram bot (two-way)
+TG_TOKEN = os.environ.get("CLAWSHELL_TG_TOKEN", "")
+TG_CHAT = os.environ.get("CLAWSHELL_TG_CHAT", "")
 
 LOG_FORMAT = "%(asctime)s [%(levelname)s] %(message)s"
 
@@ -230,6 +250,252 @@ def write_proc_json(metrics: Optional[ProcessMetrics], state: State) -> None:
         logging.error("Failed to write proc JSON: %s", e)
 
 
+# ── Config File Watcher (inotify via ctypes) ──────────────────
+
+class ConfigWatcher:
+    """Watch critical config files for modifications using Linux inotify.
+
+    Uses ctypes to call inotify syscalls directly — zero external deps.
+    Non-blocking: call process_events() from the main loop.
+    """
+
+    IN_MODIFY = 0x00000002
+    IN_ATTRIB = 0x00000004
+    IN_DELETE_SELF = 0x00000400
+    IN_MOVE_SELF = 0x00000800
+    IN_IGNORED = 0x00008000
+    WATCH_MASK = IN_MODIFY | IN_ATTRIB | IN_DELETE_SELF | IN_MOVE_SELF
+    EVENT_HEADER_SIZE = struct.calcsize("iIII")
+    ALERT_COOLDOWN = 60  # seconds between alerts for the same file
+
+    def __init__(self, paths: list):
+        lib_name = ctypes.util.find_library("c")
+        self._libc = ctypes.CDLL(lib_name, use_errno=True)
+        self._fd = self._libc.inotify_init1(os.O_NONBLOCK)
+        if self._fd < 0:
+            raise OSError(f"inotify_init1 failed: errno={ctypes.get_errno()}")
+        self._wd_to_path: dict = {}
+        self._all_paths: list = list(paths)
+        self._alert_cooldown: dict = {}
+        for path in paths:
+            self._add_watch(path)
+
+    def _add_watch(self, path: str) -> None:
+        if not os.path.exists(path):
+            logging.warning("ConfigWatcher: %s does not exist, skipping", path)
+            return
+        wd = self._libc.inotify_add_watch(
+            self._fd, path.encode(), self.WATCH_MASK)
+        if wd < 0:
+            logging.warning("ConfigWatcher: cannot watch %s (errno=%d)",
+                            path, ctypes.get_errno())
+            return
+        self._wd_to_path[wd] = path
+        logging.info("ConfigWatcher: watching %s", path)
+
+    def process_events(self) -> None:
+        """Non-blocking: drain inotify events and send alerts."""
+        readable, _, _ = select.select([self._fd], [], [], 0)
+        if not readable:
+            return
+        try:
+            buf = os.read(self._fd, 4096)
+        except OSError:
+            return
+
+        now = time.time()
+        offset = 0
+        while offset < len(buf):
+            wd, mask, _, name_len = struct.unpack_from("iIII", buf, offset)
+            offset += self.EVENT_HEADER_SIZE + name_len
+            path = self._wd_to_path.get(wd, f"unknown(wd={wd})")
+
+            # Cooldown: don't flood alerts for repeated edits
+            last = self._alert_cooldown.get(path, 0)
+            if now - last < self.ALERT_COOLDOWN:
+                continue
+            self._alert_cooldown[path] = now
+
+            filename = os.path.basename(path)
+            event_desc = self._describe_mask(mask)
+
+            if filename in ("SOUL.md", "AGENTS.md", "USER.md"):
+                level = "CRITICAL"
+                msg = (f"IDENTITY FILE TAMPERED: {filename} was {event_desc}. "
+                       "chattr +i may have been removed!")
+            else:
+                level = "WARNING"
+                msg = f"Config file changed: {filename} ({event_desc})"
+
+            logging.warning("ConfigWatcher: %s %s", path, event_desc)
+            send_alert(level, msg)
+
+            # Watch auto-removed on delete/move — will re-add in re_watch
+            if mask & (self.IN_DELETE_SELF | self.IN_MOVE_SELF | self.IN_IGNORED):
+                self._wd_to_path.pop(wd, None)
+
+    def re_watch_missing(self) -> None:
+        """Re-add watches for files that were deleted and re-created."""
+        watched = set(self._wd_to_path.values())
+        for path in self._all_paths:
+            if path not in watched and os.path.exists(path):
+                self._add_watch(path)
+
+    @staticmethod
+    def _describe_mask(mask: int) -> str:
+        parts = []
+        if mask & 0x00000002:
+            parts.append("modified")
+        if mask & 0x00000004:
+            parts.append("attributes changed")
+        if mask & 0x00000400:
+            parts.append("deleted")
+        if mask & 0x00000800:
+            parts.append("moved")
+        return ", ".join(parts) or f"event(0x{mask:x})"
+
+    def close(self) -> None:
+        if self._fd >= 0:
+            os.close(self._fd)
+            self._fd = -1
+
+
+# ── Telegram Bot (Two-Way) ────────────────────────────────────
+
+class TelegramBot:
+    """Two-way Telegram bot using getUpdates long-polling (stdlib only).
+
+    Runs in a daemon thread. Commands are queued for the main thread.
+    Authorization: only messages from CLAWSHELL_TG_CHAT are accepted.
+    """
+
+    POLL_TIMEOUT = 15
+    ERROR_BACKOFF = 30
+
+    def __init__(self, token: str, chat_id: str,
+                 command_queue: "queue.Queue",
+                 get_status_fn):
+        self._token = token
+        self._chat_id = str(chat_id)
+        self._base_url = f"https://api.telegram.org/bot{token}"
+        self._offset = 0
+        self._queue = command_queue
+        self._get_status = get_status_fn
+        self._running = True
+
+    def start(self) -> None:
+        t = threading.Thread(target=self._poll_loop,
+                             name="telegram-bot", daemon=True)
+        t.start()
+        logging.info("TelegramBot: polling started (chat_id=%s)", self._chat_id)
+
+    def stop(self) -> None:
+        self._running = False
+
+    def _api_call(self, method: str, params: dict = None,
+                  timeout: int = None) -> Optional[dict]:
+        url = f"{self._base_url}/{method}"
+        data = json.dumps(params).encode() if params else None
+        req = Request(url, data=data, method="POST" if data else "GET")
+        if data:
+            req.add_header("Content-Type", "application/json")
+        try:
+            resp = urlopen(req, timeout=timeout or 30)
+            result = json.loads(resp.read().decode())
+            if result.get("ok"):
+                return result.get("result")
+        except Exception as e:
+            logging.debug("TelegramBot API error (%s): %s", method, e)
+        return None
+
+    def send_message(self, text: str) -> bool:
+        result = self._api_call("sendMessage", {
+            "chat_id": self._chat_id,
+            "text": text,
+            "parse_mode": "Markdown",
+        })
+        return result is not None
+
+    def _poll_loop(self) -> None:
+        while self._running:
+            try:
+                updates = self._api_call("getUpdates", {
+                    "offset": self._offset,
+                    "timeout": self.POLL_TIMEOUT,
+                    "allowed_updates": ["message"],
+                }, timeout=self.POLL_TIMEOUT + 10)
+
+                if updates is None:
+                    time.sleep(self.ERROR_BACKOFF)
+                    continue
+
+                for update in updates:
+                    self._offset = update["update_id"] + 1
+                    self._handle_update(update)
+            except Exception:
+                logging.exception("TelegramBot poll error")
+                time.sleep(self.ERROR_BACKOFF)
+
+    def _handle_update(self, update: dict) -> None:
+        msg = update.get("message", {})
+        text = msg.get("text", "").strip()
+        chat_id = str(msg.get("chat", {}).get("id", ""))
+        username = msg.get("from", {}).get("username", "unknown")
+
+        if not text.startswith("/"):
+            return
+
+        # Only accept commands from the authorized chat
+        if chat_id != self._chat_id:
+            logging.warning("TelegramBot: rejected command from "
+                            "unauthorized chat %s (user: %s)",
+                            chat_id, username)
+            return
+
+        cmd = text.split()[0].lower().split("@")[0]  # strip @botname
+        logging.info("TelegramBot: command '%s' from %s", cmd, username)
+
+        if cmd == "/help":
+            self.send_message(
+                "*ClawShell Commands*\n"
+                "`/status` — Gateway state & metrics\n"
+                "`/restart` — Restart gateway service\n"
+                "`/snapshots` — List recent snapshots\n"
+                "`/help` — This help message")
+        elif cmd == "/status":
+            s = self._get_status()
+            self.send_message(
+                f"*ClawShell Status*\n"
+                f"State: `{s['state']}`\n"
+                f"PID: `{s['pid']}`\n"
+                f"Uptime: `{s['uptime']}`\n"
+                f"RSS: `{s['rss_mb']}MB`\n"
+                f"Last check: `{s['last_check']}`")
+        elif cmd == "/restart":
+            self.send_message(
+                f"Restarting gateway (requested by {username})...")
+            self._queue.put({"action": "restart", "user": username})
+        elif cmd == "/snapshots":
+            self._cmd_snapshots()
+        else:
+            self.send_message(
+                f"Unknown command: `{cmd}`\nUse /help for available commands.")
+
+    def _cmd_snapshots(self) -> None:
+        snapshot_dir = "/var/lib/occlawshell/snapshots"
+        try:
+            files = sorted(Path(snapshot_dir).glob("main-*.sqlite"),
+                           key=lambda p: p.stat().st_mtime, reverse=True)[:5]
+            if files:
+                lines = [f"`{f.name}` ({f.stat().st_size // 1024}KB)"
+                         for f in files]
+                self.send_message("*Recent Snapshots*\n" + "\n".join(lines))
+            else:
+                self.send_message("No snapshots found.")
+        except OSError as e:
+            self.send_message(f"Error listing snapshots: {e}")
+
+
 # ── ClawShell Main Class ──────────────────────────────────────
 
 class ClawShell:
@@ -246,12 +512,28 @@ class ClawShell:
         self._restart_attempted_at: Optional[float] = None
         self._recovery_attempted_at: Optional[float] = None
 
+        # Config file watcher
+        self._config_watcher: Optional[ConfigWatcher] = None
+        self._last_rewatch: float = 0.0
+        try:
+            self._config_watcher = ConfigWatcher(WATCHED_FILES)
+        except OSError as e:
+            logging.error("ConfigWatcher init failed (will run without): %s", e)
+
+        # Telegram bot (two-way)
+        self._tg_command_queue: queue.Queue = queue.Queue()
+        self._tg_bot: Optional[TelegramBot] = None
+
         signal.signal(signal.SIGTERM, self._handle_signal)
         signal.signal(signal.SIGINT, self._handle_signal)
 
     def _handle_signal(self, signum, frame):
         logging.info("Received signal %d, shutting down", signum)
         self.running = False
+        if self._tg_bot:
+            self._tg_bot.stop()
+        if self._config_watcher:
+            self._config_watcher.close()
 
     def _classify(self, metrics: Optional[ProcessMetrics],
                   http_ok: bool) -> State:
@@ -404,6 +686,58 @@ class ClawShell:
                            f"Auto-recovery script failed: {e}. "
                            "Manual intervention required.")
 
+    def _get_status(self) -> dict:
+        """Build status dict for Telegram /status command."""
+        uptime = "unknown"
+        try:
+            result = subprocess.run(
+                ["systemctl", "show", GATEWAY_SERVICE,
+                 "--property=ActiveEnterTimestamp", "--value"],
+                capture_output=True, text=True, timeout=5,
+            )
+            ts = result.stdout.strip()
+            if ts:
+                uptime = ts
+        except (subprocess.TimeoutExpired, OSError):
+            pass
+        return {
+            "state": self.state.value,
+            "pid": self.prev_metrics.pid if self.prev_metrics else "N/A",
+            "uptime": uptime,
+            "rss_mb": (self.prev_metrics.rss_bytes // (1024 * 1024)
+                       if self.prev_metrics else "N/A"),
+            "last_check": datetime.fromtimestamp(
+                self.last_collect, tz=timezone.utc
+            ).strftime("%H:%M:%S UTC") if self.last_collect else "never",
+        }
+
+    def _process_tg_commands(self) -> None:
+        """Process commands queued by TelegramBot thread."""
+        while not self._tg_command_queue.empty():
+            try:
+                cmd = self._tg_command_queue.get_nowait()
+            except queue.Empty:
+                break
+            action = cmd.get("action")
+            user = cmd.get("user", "unknown")
+
+            if action == "restart":
+                logging.info("Telegram: restart requested by %s", user)
+                send_alert("WARNING",
+                           f"Gateway restart via Telegram by {user}")
+                try:
+                    result = subprocess.run(
+                        ["sudo", "systemctl", "restart", GATEWAY_SERVICE],
+                        timeout=30, capture_output=True, text=True,
+                    )
+                    msg = ("Gateway restarted successfully."
+                           if result.returncode == 0
+                           else f"Restart failed: {result.stderr[:200]}")
+                except (subprocess.TimeoutExpired, OSError) as e:
+                    msg = f"Restart error: {e}"
+                if self._tg_bot:
+                    self._tg_bot.send_message(msg)
+
     def _tick(self) -> None:
         """Single collection + classification cycle (every 30s)."""
         pid = find_gateway_pid()
@@ -433,6 +767,18 @@ class ClawShell:
                      HANG_WARN_SECS, HANG_CRIT_SECS)
         sd_notify("READY=1")
 
+        # Start Telegram bot if credentials are configured
+        if TG_TOKEN and TG_CHAT:
+            try:
+                self._tg_bot = TelegramBot(
+                    TG_TOKEN, TG_CHAT,
+                    self._tg_command_queue,
+                    self._get_status,
+                )
+                self._tg_bot.start()
+            except Exception:
+                logging.exception("Failed to start Telegram bot")
+
         while self.running:
             sd_notify("WATCHDOG=1")
 
@@ -444,9 +790,26 @@ class ClawShell:
                     logging.exception("Error in collection tick")
                 self.last_collect = now
 
+            # Config file watcher (non-blocking)
+            if self._config_watcher:
+                try:
+                    self._config_watcher.process_events()
+                    if now - self._last_rewatch >= CONFIG_REWATCH_INTERVAL:
+                        self._config_watcher.re_watch_missing()
+                        self._last_rewatch = now
+                except Exception:
+                    logging.exception("Error in config watcher")
+
+            # Telegram command processing
+            self._process_tg_commands()
+
             time.sleep(TICK_INTERVAL)
 
         sd_notify("STOPPING=1")
+        if self._config_watcher:
+            self._config_watcher.close()
+        if self._tg_bot:
+            self._tg_bot.stop()
         logging.info("ClawShell stopped")
 
 

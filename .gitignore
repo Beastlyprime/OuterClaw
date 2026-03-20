@@ -7,6 +7,7 @@
 !dev_plan.md
 !deploy.sh
 !clawshell.py
+!test_clawshell.py
 
 # Shell scripts
 !scripts/
