@@ -93,6 +93,10 @@ ClawShell 只做 OpenClaw 不可能自己做的事：
   - [x] Telegram 双向交互 (TelegramBot, /status /restart /snapshots /help)
   - [x] 自动读取 OpenClaw Telegram 配置 (零配置告警)
   - [x] `--status` 命令行状态报告 (v1.0)
+  - [x] Telegram 自动读取 OpenClaw 配置 (零配置告警)
+  - [x] 身份文件 lock/unlock 命令 (CLI + Telegram, 10 分钟自动重新锁定)
+  - [x] 修复 NoNewPrivileges 阻止 sudo 问题
+  - [x] 修复 ProtectSystem=strict 阻止 chattr 问题 (改用 systemd oneshot)
 
 ### 待开发
 - [ ] 日常运行稳定性观察 (1-2 周运行无异常)
@@ -118,8 +122,11 @@ ClawShell 只做 OpenClaw 不可能自己做的事：
 | `scripts/pre-start-check.sh` | 启动前 SQLite 校验 |
 | `scripts/quota-check.sh` | 磁盘配额 + 应急裁剪 |
 | `scripts/io-pressure-check.sh` | PSI I/O 压力门控 |
+| `scripts/identity-lock.sh` | 身份文件 chattr +i/-i (lock/unlock) |
 | `scripts/migrate-to-ocagent.sh` | 数据迁移 + 路径修复 |
 | `systemd/oc-clawshell.service` | 守护进程 (Type=notify, WatchdogSec=120) |
+| `systemd/oc-identity-lock.service` | 身份文件锁定 (oneshot, 跳出沙箱) |
+| `systemd/oc-identity-unlock.service` | 身份文件解锁 (oneshot, 跳出沙箱) |
 | `systemd/oc-snapshot.timer/service` | 30min 快照 |
 | `systemd/oc-healthcheck.timer/service` | 2min 健康检查 |
 | `systemd/oc-lkg-promote.timer/service` | 2h LKG 提升 |
@@ -160,21 +167,21 @@ Agent 被提示注入攻破后，以 `ocagent` 身份执行 exec 命令的攻击
 | # | 测试 | 命令 | 预期结果 | 状态 |
 |---|------|------|----------|------|
 | 1 | Agent 无法访问 vault | `sudo -u ocagent ls /var/lib/occlawshell/` | Permission denied | ✅ |
-| 2 | Agent 无法杀死 ClawShell | `sudo -u ocagent kill $(pgrep -u occlawshell)` | Operation not permitted | |
-| 3 | Agent 无法修改 SOUL.md | `sudo -u ocagent echo 'x' >> SOUL.md` | Operation not permitted | |
-| 4 | ClawShell 可读 workspace | `sudo -u occlawshell cat MEMORY.md` | 内容显示 | |
+| 2 | Agent 无法杀死 ClawShell | `sudo -u ocagent kill $(pgrep -u occlawshell)` | Operation not permitted | ✅ |
+| 3 | Agent 无法修改 SOUL.md | `sudo -u ocagent echo 'x' >> SOUL.md` | Operation not permitted | ✅ |
+| 4 | ClawShell 可读 workspace | `sudo -u occlawshell cat MEMORY.md` | 内容显示 | ✅ |
 | 5 | ClawShell 不可写 workspace | `sudo -u occlawshell touch workspace/test` | Permission denied | ✅ |
 | 6 | SQLite 备份正常 | `sudo systemctl start oc-snapshot.service` | status=0/SUCCESS | ✅ |
-| 7 | 备份完整性通过 | `sqlite3 main-*.sqlite "PRAGMA integrity_check"` | ok | |
+| 7 | 备份完整性通过 | `sqlite3 main-*.sqlite "PRAGMA integrity_check"` | ok | ✅ |
 | 8 | 崩溃时收集 postmortem | `sudo systemctl kill -s SIGABRT openclaw-gateway` | 生成 postmortem | |
 | 9 | Gateway 自动重启 | 测试 8 之后 | active (running) | |
 | 10 | LKG 提升正常 | 等待 oc-lkg-promote.timer | 生成 LKG + 符号链接 | |
 | 11 | 回滚恢复状态 | `sudo /var/lib/occlawshell/bin/rollback.sh` | SQLite + memory 恢复 | |
 | 12 | sudo 被 OS 级阻止 | `sudo -u ocagent sudo -l` | 要求密码 | ✅ |
 | 13 | 快照定时器触发 | `systemctl list-timers oc-snapshot.timer` | 显示下次触发时间 | ✅ |
-| 14 | 告警到达 Telegram | 触发测试告警 | Telegram 收到消息 | |
-| 15 | 挂起检测：无误报 | 大模型推理 5 分钟 | HEAVY_INFERENCE，无告警 | |
+| 14 | 告警到达 Telegram | 触发测试告警 | Telegram 收到消息 | ✅ |
+| 15 | 挂起检测：无误报 | 大模型推理 5 分钟 | HEAVY_INFERENCE，无告警 | ✅ |
 | 16 | 挂起检测：真阳性 | `kill -STOP $(pgrep openclaw)` | CONFIRMED_HANG | |
-| 17 | inotify 检测篡改 | 修改 openclaw.json | WARNING 告警 | |
-| 18 | Telegram /status | 发送 /status | 返回状态 | |
+| 17 | inotify 检测篡改 | 修改 openclaw.json | WARNING 告警 | ✅ |
+| 18 | Telegram /status | 发送 /status | 返回状态 | ✅ |
 | 19 | --status 报告 | `clawshell.py --status` | 显示完整状态 | ✅ |
