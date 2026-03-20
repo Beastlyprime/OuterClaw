@@ -18,6 +18,34 @@ if [[ -f "$ENV_FILE" ]]; then
     TG_CHAT=$(grep -oP '^CLAWSHELL_TG_CHAT=\K.+' "$ENV_FILE" 2>/dev/null || true)
 fi
 
+# Fallback: read from OpenClaw's openclaw.json if not configured in clawshell.env
+if [[ -z "$TG_TOKEN" || -z "$TG_CHAT" ]]; then
+    OPENCLAW_DIR=$(grep -oP '^OPENCLAW_DIR=\K.+' "$ENV_FILE" 2>/dev/null || true)
+    OPENCLAW_DIR="${OPENCLAW_DIR:-/home/ocagent/.openclaw}"
+    OC_CONFIG="${OPENCLAW_DIR}/openclaw.json"
+    if [[ -r "$OC_CONFIG" ]]; then
+        if [[ -z "$TG_TOKEN" ]]; then
+            TG_TOKEN=$(OC_CFG="$OC_CONFIG" python3 -c "
+import json,os
+try:
+    d=json.load(open(os.environ['OC_CFG']))
+    print(d.get('channels',{}).get('telegram',{}).get('botToken',''))
+except: pass
+" 2>/dev/null || true)
+        fi
+        if [[ -z "$TG_CHAT" ]]; then
+            TG_CHAT=$(OC_CFG="$OC_CONFIG" python3 -c "
+import json,os
+try:
+    d=json.load(open(os.environ['OC_CFG']))
+    af=d.get('channels',{}).get('telegram',{}).get('allowFrom',[])
+    if af: print(af[0])
+except: pass
+" 2>/dev/null || true)
+        fi
+    fi
+fi
+
 # Always log locally
 echo "[$TS] [$LEVEL] $MESSAGE" >> "$LOG"
 

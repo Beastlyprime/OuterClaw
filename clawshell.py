@@ -69,9 +69,27 @@ WATCHED_FILES = [
 ]
 CONFIG_REWATCH_INTERVAL = 300  # Re-check for deleted-then-recreated files every 5 min
 
-# Telegram bot (two-way)
+# Telegram bot (two-way) — only polls if dedicated ClawShell bot is configured
+# If not configured, alert.sh handles one-way alerts using OpenClaw's bot token
 TG_TOKEN = os.environ.get("CLAWSHELL_TG_TOKEN", "")
 TG_CHAT = os.environ.get("CLAWSHELL_TG_CHAT", "")
+
+# Fallback: read from OpenClaw's openclaw.json for one-way alerts
+# (two-way polling is NOT started with fallback token to avoid getUpdates conflicts)
+TG_IS_DEDICATED = bool(TG_TOKEN and TG_CHAT)
+if not TG_TOKEN or not TG_CHAT:
+    _oc_config = os.path.join(OPENCLAW_DIR, "openclaw.json")
+    try:
+        with open(_oc_config) as f:
+            _oc = json.load(f)
+        _tg = _oc.get("channels", {}).get("telegram", {})
+        if not TG_TOKEN:
+            TG_TOKEN = _tg.get("botToken", "")
+        if not TG_CHAT:
+            _af = _tg.get("allowFrom", [])
+            TG_CHAT = str(_af[0]) if _af else ""
+    except (OSError, json.JSONDecodeError, PermissionError):
+        pass
 
 VERSION = "1.0"
 LOG_FORMAT = "%(asctime)s [%(levelname)s] %(message)s"
@@ -765,8 +783,9 @@ class ClawShell:
                      HANG_WARN_SECS, HANG_CRIT_SECS)
         sd_notify("READY=1")
 
-        # Start Telegram bot if credentials are configured
-        if TG_TOKEN and TG_CHAT:
+        # Start two-way Telegram bot only if dedicated ClawShell bot is configured
+        # (shared OpenClaw bot token is used for one-way alerts via alert.sh only)
+        if TG_IS_DEDICATED:
             try:
                 self._tg_bot = TelegramBot(
                     TG_TOKEN, TG_CHAT,
