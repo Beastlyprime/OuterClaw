@@ -3,6 +3,7 @@
 
 # ── Project files (whitelist) ──
 !.gitignore
+!README.md
 !CLAUDE.md
 !dev_plan.md
 !deploy.sh
