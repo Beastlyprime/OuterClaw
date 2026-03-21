@@ -24,8 +24,18 @@ if [[ $EUID -ne 0 ]]; then
     exit 1
 fi
 
-if ! id yimeng &>/dev/null; then
-    echo "ERROR: User 'yimeng' not found"
+# Detect the human admin user (who ran sudo)
+HUMAN_USER="${SUDO_USER:-}"
+if [[ -z "$HUMAN_USER" || "$HUMAN_USER" == "root" ]]; then
+    for u in $(getent passwd | awk -F: '$3 >= 1000 && $3 < 60000 {print $1}'); do
+        if [[ -d "/home/$u/.openclaw" ]]; then
+            HUMAN_USER="$u"
+            break
+        fi
+    done
+fi
+if [[ -z "$HUMAN_USER" ]]; then
+    echo "ERROR: Cannot detect admin user. Run with: sudo bash deploy.sh"
     exit 1
 fi
 
@@ -56,16 +66,16 @@ else
 fi
 
 # 1c. Data migration check
-if [[ -d "/home/yimeng/.openclaw" && ! -d "${OPENCLAW_DIR}" ]]; then
+if [[ -d "/home/${HUMAN_USER}/.openclaw" && ! -d "${OPENCLAW_DIR}" ]]; then
     echo ""
     echo "  ╔══════════════════════════════════════════════════════════╗"
     echo "  ║  DATA MIGRATION REQUIRED                                 ║"
     echo "  ╚══════════════════════════════════════════════════════════╝"
-    echo "  Detected /home/yimeng/.openclaw but ${OPENCLAW_DIR} does not exist."
+    echo "  Detected /home/${HUMAN_USER}/.openclaw but ${OPENCLAW_DIR} does not exist."
     echo "  Run the following commands to migrate:"
     echo ""
     echo "    systemctl stop openclaw-gateway"
-    echo "    sudo cp -a /home/yimeng/.openclaw ${OPENCLAW_DIR}"
+    echo "    sudo cp -a /home/${HUMAN_USER}/.openclaw ${OPENCLAW_DIR}"
     echo "    sudo chown -R ${AGENT_USER}:${AGENT_USER} ${OPENCLAW_DIR}"
     echo "    sudo systemctl start openclaw-gateway"
     echo ""
@@ -81,14 +91,14 @@ if [[ -z "${OPENCLAW_BIN:-}" ]]; then
     # Method 1: Ask ocagent's login shell (preferred — this is who runs OpenClaw)
     OPENCLAW_BIN=$(sudo -u "${AGENT_USER}" bash -lc 'command -v openclaw' 2>/dev/null) || true
 
-    # Method 2: Ask yimeng's login shell (finds nvm-managed installs)
+    # Method 2: Ask admin user's login shell (finds nvm-managed installs)
     if [[ -z "$OPENCLAW_BIN" || ! -x "${OPENCLAW_BIN:-}" ]]; then
-        OPENCLAW_BIN=$(sudo -u yimeng bash -lc 'command -v openclaw' 2>/dev/null) || true
+        OPENCLAW_BIN=$(sudo -u "$HUMAN_USER" bash -lc 'command -v openclaw' 2>/dev/null) || true
     fi
 
     # Method 3: Search common global npm paths
     if [[ -z "$OPENCLAW_BIN" || ! -x "${OPENCLAW_BIN:-}" ]]; then
-        for search_dir in "${AGENT_HOME}/.npm-global" /home/yimeng/.nvm /usr/local/lib; do
+        for search_dir in "${AGENT_HOME}/.npm-global" "/home/${HUMAN_USER}/.nvm" /usr/local/lib; do
             if [[ -d "$search_dir" ]]; then
                 OPENCLAW_BIN=$(find "$search_dir" -name openclaw -path '*/bin/openclaw' -type f 2>/dev/null | sort -V | tail -1) || true
                 [[ -n "$OPENCLAW_BIN" && -x "$OPENCLAW_BIN" ]] && break

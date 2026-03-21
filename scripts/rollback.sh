@@ -11,6 +11,15 @@ AGENT_USER="${AGENT_USER:-ocagent}"
 OPENCLAW_DIR=$(grep '^OPENCLAW_DIR=' "${ENV_FILE}" 2>/dev/null | cut -d= -f2)
 OPENCLAW_DIR="${OPENCLAW_DIR:-/home/ocagent/.openclaw}"
 
+# Validate AGENT_USER and OPENCLAW_DIR to prevent injection (script runs as root)
+if [[ ! "$AGENT_USER" =~ ^[a-z_][a-z0-9_-]*$ ]]; then
+    echo "FATAL: Invalid AGENT_USER='${AGENT_USER}'" >&2; exit 1
+fi
+OPENCLAW_DIR=$(realpath -m "$OPENCLAW_DIR" 2>/dev/null)
+if [[ ! "$OPENCLAW_DIR" =~ ^/home/ || "$OPENCLAW_DIR" == *..* ]]; then
+    echo "FATAL: Invalid OPENCLAW_DIR='${OPENCLAW_DIR}'" >&2; exit 1
+fi
+
 LKG="${1:-/var/lib/occlawshell/lkg/current}"
 
 # Resolve symlink
@@ -66,7 +75,7 @@ echo "Pre-rollback snapshot saved: $EMERGENCY_DIR"
 # Restore SQLite
 if [[ -f "$LKG/main.sqlite" ]]; then
     cp -p "$LKG/main.sqlite" "${OPENCLAW_DIR}/memory/main.sqlite"
-    chown ${AGENT_USER}:${AGENT_USER} "${OPENCLAW_DIR}/memory/main.sqlite"
+    chown "${AGENT_USER}:${AGENT_USER}" "${OPENCLAW_DIR}/memory/main.sqlite"
     chmod 600 "${OPENCLAW_DIR}/memory/main.sqlite"
     echo "  ✓ SQLite restored"
 fi
@@ -74,14 +83,14 @@ fi
 # Restore MEMORY.md
 if [[ -f "$LKG/MEMORY.md" ]]; then
     cp -p "$LKG/MEMORY.md" "${OPENCLAW_DIR}/workspace/MEMORY.md"
-    chown ${AGENT_USER}:${AGENT_USER} "${OPENCLAW_DIR}/workspace/MEMORY.md"
+    chown "${AGENT_USER}:${AGENT_USER}" "${OPENCLAW_DIR}/workspace/MEMORY.md"
     echo "  ✓ MEMORY.md restored"
 fi
 
 # Restore memory directory
 if [[ -d "$LKG/memory" ]]; then
     rsync -a --delete "$LKG/memory/" "${OPENCLAW_DIR}/workspace/memory/"
-    chown -R ${AGENT_USER}:${AGENT_USER} "${OPENCLAW_DIR}/workspace/memory/"
+    chown -R "${AGENT_USER}:${AGENT_USER}" "${OPENCLAW_DIR}/workspace/memory/"
     echo "  ✓ memory/ restored"
 fi
 
@@ -90,7 +99,7 @@ if [[ -f "$LKG/config/openclaw.json" ]]; then
     read -p "Also restore openclaw.json? (y/N): " RESTORE_CONFIG
     if [[ "$RESTORE_CONFIG" == "y" || "$RESTORE_CONFIG" == "Y" ]]; then
         cp -p "$LKG/config/openclaw.json" "${OPENCLAW_DIR}/openclaw.json"
-        chown ${AGENT_USER}:${AGENT_USER} "${OPENCLAW_DIR}/openclaw.json"
+        chown "${AGENT_USER}:${AGENT_USER}" "${OPENCLAW_DIR}/openclaw.json"
         chmod 600 "${OPENCLAW_DIR}/openclaw.json"
         echo "  ✓ openclaw.json restored"
     fi

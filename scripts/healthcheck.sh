@@ -40,7 +40,7 @@ if [[ -n "$N_RESTARTS" && "$N_RESTARTS" -gt 0 ]]; then
     # Check if this is new
     PREV_RESTARTS=0
     if [[ -f "$STATE_FILE" ]]; then
-        PREV_RESTARTS=$(python3 -c "import json; print(json.load(open('$STATE_FILE')).get('restarts',0))" 2>/dev/null || echo 0)
+        PREV_RESTARTS=$(HC_STATE_FILE="$STATE_FILE" python3 -c "import json,os; print(json.load(open(os.environ['HC_STATE_FILE'])).get('restarts',0))" 2>/dev/null || echo 0)
     fi
     if [[ "$N_RESTARTS" -gt "$PREV_RESTARTS" ]]; then
         "$ALERT" WARNING "Gateway restarted (count: ${N_RESTARTS}, was: ${PREV_RESTARTS})"

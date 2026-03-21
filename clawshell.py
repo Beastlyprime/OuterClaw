@@ -548,6 +548,9 @@ class TelegramBot:
         text = msg.get("text", "").strip()
         chat_id = str(msg.get("chat", {}).get("id", ""))
         username = msg.get("from", {}).get("username", "unknown")
+        # Sanitize username for safe Markdown interpolation
+        for ch in ('\\', '`', '*', '_', '[', ']', '(', ')'):
+            username = username.replace(ch, '\\' + ch)
 
         if not text.startswith("/"):
             return
@@ -981,12 +984,13 @@ class ClawShell:
 
             elif action == "kill_session":
                 session_id = cmd.get("session_id", "")
-                logging.info("Telegram: kill_session %s requested by %s",
-                             session_id, user)
-                send_alert("INFO",
-                           f"Session {session_id} kill via Telegram by {user}")
                 ok, msg = kill_session(session_id)
-                if not ok:
+                if ok:
+                    logging.info("Telegram: kill_session %s by %s",
+                                 session_id, user)
+                    send_alert("INFO",
+                               f"Session {session_id} kill via Telegram by {user}")
+                else:
                     logging.error("kill_session failed: %s", msg)
                 if self._tg_bot:
                     self._tg_bot.send_message(msg)
