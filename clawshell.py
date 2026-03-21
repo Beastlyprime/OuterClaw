@@ -6,9 +6,12 @@ and provides independent alerting. Detects hangs, zombies, and crashes that
 the process cannot self-detect.
 
 Usage:
-  clawshell.py           Run the watchdog daemon (systemd)
-  clawshell.py --status  Show guardian status report
-  clawshell.py --help    Show this help
+  clawshell.py                      Run the watchdog daemon (systemd)
+  clawshell.py --status             Show guardian status report
+  clawshell.py --kill               Stop the gateway process
+  clawshell.py --sessions           List active sessions
+  clawshell.py --kill-session <id>  Kill a specific session
+  clawshell.py --help               Show this help
 
 State machine:
   UNKNOWN → HEALTHY → HEAVY_INFERENCE → POSSIBLE_HANG → CONFIRMED_HANG
@@ -61,6 +64,10 @@ RECOVERY_COOLDOWN = 1800   # Don't retry recovery for 30 minutes after an attemp
 
 IDENTITY_LOCK_SCRIPT = "/var/lib/occlawshell/bin/identity-lock.sh"
 IDENTITY_UNLOCK_TIMEOUT = 600  # 10 minutes auto-relock
+
+# Process management
+SESSIONS_URL = f"http://127.0.0.1:{GATEWAY_PORT}/sessions"
+SESSIONS_TIMEOUT = 10  # HTTP timeout for session API calls
 
 # Config file monitoring
 OPENCLAW_DIR = os.environ.get("OPENCLAW_DIR", "/home/ocagent/.openclaw")
@@ -238,6 +245,33 @@ def check_health() -> bool:
         return resp.status == 200
     except Exception:
         return False
+
+
+def list_sessions() -> Optional[list]:
+    """Query OpenClaw gateway for active sessions. Returns list or None."""
+    try:
+        req = Request(SESSIONS_URL, method="GET")
+        resp = urlopen(req, timeout=SESSIONS_TIMEOUT)
+        data = json.loads(resp.read().decode())
+        if isinstance(data, list):
+            return data
+        # Handle {"sessions": [...]} wrapper
+        if isinstance(data, dict) and "sessions" in data:
+            return data["sessions"]
+        return []
+    except Exception:
+        return None
+
+
+def kill_session(session_id: str) -> tuple:
+    """Kill a specific session via OpenClaw API. Returns (success, message)."""
+    url = f"{SESSIONS_URL}/{session_id}"
+    try:
+        req = Request(url, method="DELETE")
+        resp = urlopen(req, timeout=SESSIONS_TIMEOUT)
+        return (True, f"Session {session_id} terminated.")
+    except Exception as e:
+        return (False, f"Failed to kill session {session_id}: {e}")
 
 
 def send_alert(level: str, message: str) -> None:
@@ -479,6 +513,9 @@ class TelegramBot:
                 "*ClawShell Commands*\n"
                 "`/status` — Gateway state & metrics\n"
                 "`/restart` — Restart gateway service\n"
+                "`/kill` — Stop gateway process\n"
+                "`/sessions` — List active sessions\n"
+                "`/kill_session <id>` — Kill a specific session\n"
                 "`/snapshots` — List recent snapshots\n"
                 "`/unlock_identity` — Unlock identity files (10 min timeout)\n"
                 "`/lock_identity` — Lock identity files\n"
@@ -504,9 +541,54 @@ class TelegramBot:
             self._queue.put({"action": "unlock_identity", "user": username})
         elif cmd == "/lock_identity":
             self._queue.put({"action": "lock_identity", "user": username})
+        elif cmd == "/kill":
+            self.send_message(
+                f"⚠️ Stopping gateway (requested by {username})...")
+            self._queue.put({"action": "kill", "user": username})
+        elif cmd == "/sessions":
+            self._cmd_sessions()
+        elif cmd == "/kill_session":
+            parts = text.split()
+            if len(parts) < 2:
+                self.send_message(
+                    "Usage: `/kill_session <session_id>`\n"
+                    "Use `/sessions` to list active sessions.")
+            else:
+                session_id = parts[1]
+                self.send_message(
+                    f"Killing session `{session_id}` "
+                    f"(requested by {username})...")
+                self._queue.put({
+                    "action": "kill_session",
+                    "session_id": session_id,
+                    "user": username,
+                })
         else:
             self.send_message(
                 f"Unknown command: `{cmd}`\nUse /help for available commands.")
+
+    def _cmd_sessions(self) -> None:
+        """List active sessions from OpenClaw gateway."""
+        sessions = list_sessions()
+        if sessions is None:
+            self.send_message("Failed to query sessions (gateway unreachable).")
+            return
+        if not sessions:
+            self.send_message("No active sessions.")
+            return
+        lines = []
+        for s in sessions[:20]:  # Cap display at 20
+            sid = s.get("id", s.get("session_id", "?"))
+            created = s.get("created", s.get("started_at", ""))
+            status = s.get("status", s.get("state", ""))
+            line = f"`{sid}`"
+            if status:
+                line += f" [{status}]"
+            if created:
+                line += f" ({created})"
+            lines.append(line)
+        header = f"*Active Sessions ({len(sessions)})*\n"
+        self.send_message(header + "\n".join(lines))
 
     def _cmd_snapshots(self) -> None:
         snapshot_dir = "/var/lib/occlawshell/snapshots"
@@ -824,6 +906,35 @@ class ClawShell:
                 if self._tg_bot:
                     self._tg_bot.send_message(msg)
 
+            elif action == "kill":
+                logging.info("Telegram: kill requested by %s", user)
+                send_alert("WARNING",
+                           f"Gateway STOP via Telegram by {user}")
+                try:
+                    result = subprocess.run(
+                        ["sudo", "systemctl", "stop", GATEWAY_SERVICE],
+                        timeout=30, capture_output=True, text=True,
+                    )
+                    msg = ("Gateway stopped successfully."
+                           if result.returncode == 0
+                           else f"Stop failed: {result.stderr[:200]}")
+                except (subprocess.TimeoutExpired, OSError) as e:
+                    msg = f"Stop error: {e}"
+                if self._tg_bot:
+                    self._tg_bot.send_message(msg)
+
+            elif action == "kill_session":
+                session_id = cmd.get("session_id", "")
+                logging.info("Telegram: kill_session %s requested by %s",
+                             session_id, user)
+                send_alert("INFO",
+                           f"Session {session_id} kill via Telegram by {user}")
+                ok, msg = kill_session(session_id)
+                if not ok:
+                    logging.error("kill_session failed: %s", msg)
+                if self._tg_bot:
+                    self._tg_bot.send_message(msg)
+
     def _tick(self) -> None:
         """Single collection + classification cycle (every 30s)."""
         pid = find_gateway_pid()
@@ -1113,6 +1224,56 @@ def show_status() -> None:
 
 # ── Entry Point ────────────────────────────────────────────────
 
+def _kill_gateway() -> None:
+    """Stop the OpenClaw gateway service."""
+    print("Stopping gateway...")
+    try:
+        result = subprocess.run(
+            ["sudo", "systemctl", "stop", GATEWAY_SERVICE],
+            timeout=30, text=True,
+        )
+        if result.returncode == 0:
+            print("Gateway stopped successfully.")
+        else:
+            print("Failed to stop gateway.", file=sys.stderr)
+            sys.exit(1)
+    except (subprocess.TimeoutExpired, OSError) as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+
+def _show_sessions() -> None:
+    """List active sessions from the OpenClaw gateway."""
+    sessions = list_sessions()
+    if sessions is None:
+        print("Failed to query sessions (gateway unreachable).",
+              file=sys.stderr)
+        sys.exit(1)
+    if not sessions:
+        print("No active sessions.")
+        return
+    print(f"Active Sessions ({len(sessions)}):")
+    print("-" * 60)
+    for s in sessions:
+        sid = s.get("id", s.get("session_id", "?"))
+        created = s.get("created", s.get("started_at", ""))
+        status = s.get("status", s.get("state", ""))
+        line = f"  {sid}"
+        if status:
+            line += f"  [{status}]"
+        if created:
+            line += f"  ({created})"
+        print(line)
+
+
+def _kill_session_cli(session_id: str) -> None:
+    """Kill a specific session via CLI."""
+    ok, msg = kill_session(session_id)
+    print(msg)
+    if not ok:
+        sys.exit(1)
+
+
 def _run_identity_cmd(action: str) -> None:
     """Run identity lock/unlock via sudo."""
     try:
@@ -1135,6 +1296,20 @@ def main():
         return
     if "--help" in sys.argv or "-h" in sys.argv:
         print(__doc__)
+        return
+    if "--kill" in sys.argv:
+        _kill_gateway()
+        return
+    if "--sessions" in sys.argv:
+        _show_sessions()
+        return
+    if "--kill-session" in sys.argv:
+        idx = sys.argv.index("--kill-session")
+        if idx + 1 >= len(sys.argv):
+            print("Usage: clawshell.py --kill-session <session_id>",
+                  file=sys.stderr)
+            sys.exit(1)
+        _kill_session_cli(sys.argv[idx + 1])
         return
     if "--unlock-identity" in sys.argv:
         _run_identity_cmd("unlock")

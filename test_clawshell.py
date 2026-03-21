@@ -16,7 +16,7 @@ import clawshell
 from clawshell import (
     State, ProcessMetrics, ClawShell, find_gateway_pid, collect_proc,
     check_health, send_alert, write_proc_json, sd_notify,
-    ConfigWatcher, TelegramBot,
+    ConfigWatcher, TelegramBot, list_sessions, kill_session,
 )
 
 # ── ProcessMetrics and Enum Tests ──────────────────────────────
@@ -374,6 +374,133 @@ class TestTelegramBot(unittest.TestCase):
             self.bot._handle_update(update)
             mock_send.assert_called_once()
             self.assertIn("HEALTHY", mock_send.call_args[0][0])
+
+
+class TestProcessManagement(unittest.TestCase):
+    """Tests for /kill, /sessions, /kill_session commands."""
+
+    def setUp(self):
+        import queue
+        self.cmd_queue = queue.Queue()
+        self.status_fn = lambda: {
+            "state": "HEALTHY", "pid": 123,
+            "uptime": "2h", "rss_mb": 400, "last_check": "12:00:00 UTC",
+        }
+        self.bot = TelegramBot(
+            "fake_token", "12345",
+            self.cmd_queue, self.status_fn,
+        )
+
+    def _make_update(self, text, update_id=1):
+        return {
+            "update_id": update_id,
+            "message": {
+                "text": text,
+                "chat": {"id": 12345},
+                "from": {"username": "admin"},
+            }
+        }
+
+    def test_kill_queues_command(self):
+        with patch.object(self.bot, "send_message"):
+            self.bot._handle_update(self._make_update("/kill"))
+            self.assertFalse(self.cmd_queue.empty())
+            cmd = self.cmd_queue.get_nowait()
+            self.assertEqual(cmd["action"], "kill")
+            self.assertEqual(cmd["user"], "admin")
+
+    def test_sessions_command_success(self):
+        sessions = [
+            {"id": "sess-001", "status": "active", "created": "2026-03-21T10:00:00Z"},
+            {"id": "sess-002", "status": "idle", "created": "2026-03-21T09:00:00Z"},
+        ]
+        with patch.object(self.bot, "send_message") as mock_send, \
+             patch("clawshell.list_sessions", return_value=sessions):
+            self.bot._handle_update(self._make_update("/sessions"))
+            mock_send.assert_called_once()
+            msg = mock_send.call_args[0][0]
+            self.assertIn("sess-001", msg)
+            self.assertIn("sess-002", msg)
+            self.assertIn("Active Sessions", msg)
+
+    def test_sessions_command_gateway_unreachable(self):
+        with patch.object(self.bot, "send_message") as mock_send, \
+             patch("clawshell.list_sessions", return_value=None):
+            self.bot._handle_update(self._make_update("/sessions"))
+            mock_send.assert_called_once()
+            self.assertIn("unreachable", mock_send.call_args[0][0])
+
+    def test_sessions_command_empty(self):
+        with patch.object(self.bot, "send_message") as mock_send, \
+             patch("clawshell.list_sessions", return_value=[]):
+            self.bot._handle_update(self._make_update("/sessions"))
+            mock_send.assert_called_once()
+            self.assertIn("No active sessions", mock_send.call_args[0][0])
+
+    def test_kill_session_queues_command(self):
+        with patch.object(self.bot, "send_message"):
+            self.bot._handle_update(self._make_update("/kill_session sess-001"))
+            self.assertFalse(self.cmd_queue.empty())
+            cmd = self.cmd_queue.get_nowait()
+            self.assertEqual(cmd["action"], "kill_session")
+            self.assertEqual(cmd["session_id"], "sess-001")
+
+    def test_kill_session_no_id(self):
+        with patch.object(self.bot, "send_message") as mock_send:
+            self.bot._handle_update(self._make_update("/kill_session"))
+            mock_send.assert_called()
+            self.assertIn("Usage", mock_send.call_args[0][0])
+
+    def test_help_includes_new_commands(self):
+        with patch.object(self.bot, "send_message") as mock_send:
+            self.bot._handle_update(self._make_update("/help"))
+            msg = mock_send.call_args[0][0]
+            self.assertIn("/kill", msg)
+            self.assertIn("/sessions", msg)
+            self.assertIn("/kill_session", msg)
+
+    @patch("clawshell.urlopen")
+    def test_list_sessions_returns_list(self, mock_urlopen):
+        mock_resp = MagicMock()
+        mock_resp.read.return_value = json.dumps([
+            {"id": "s1", "status": "active"}
+        ]).encode()
+        mock_urlopen.return_value = mock_resp
+        result = list_sessions()
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0]["id"], "s1")
+
+    @patch("clawshell.urlopen")
+    def test_list_sessions_handles_wrapped_response(self, mock_urlopen):
+        mock_resp = MagicMock()
+        mock_resp.read.return_value = json.dumps({
+            "sessions": [{"id": "s1"}]
+        }).encode()
+        mock_urlopen.return_value = mock_resp
+        result = list_sessions()
+        self.assertEqual(len(result), 1)
+
+    @patch("clawshell.urlopen")
+    def test_list_sessions_returns_none_on_error(self, mock_urlopen):
+        mock_urlopen.side_effect = Exception("Connection refused")
+        result = list_sessions()
+        self.assertIsNone(result)
+
+    @patch("clawshell.urlopen")
+    def test_kill_session_success(self, mock_urlopen):
+        mock_resp = MagicMock()
+        mock_resp.status = 200
+        mock_urlopen.return_value = mock_resp
+        ok, msg = kill_session("sess-001")
+        self.assertTrue(ok)
+        self.assertIn("terminated", msg)
+
+    @patch("clawshell.urlopen")
+    def test_kill_session_failure(self, mock_urlopen):
+        mock_urlopen.side_effect = Exception("404 Not Found")
+        ok, msg = kill_session("sess-999")
+        self.assertFalse(ok)
+        self.assertIn("Failed", msg)
 
 
 if __name__ == "__main__":
