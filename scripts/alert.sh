@@ -50,7 +50,8 @@ fi
 echo "[$TS] [$LEVEL] $MESSAGE" >> "$LOG"
 
 # Send via Telegram if configured
-if [[ -n "$TG_TOKEN" && -n "$TG_CHAT" ]]; then
+# Validate TG_CHAT is numeric (positive or negative for group chats)
+if [[ -n "$TG_TOKEN" && -n "$TG_CHAT" && "$TG_CHAT" =~ ^-?[0-9]+$ ]]; then
     case "$LEVEL" in
         CRITICAL) EMOJI="🚨" ;;
         WARNING)  EMOJI="⚠️" ;;

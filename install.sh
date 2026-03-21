@@ -274,10 +274,12 @@ for script in "${SCRIPT_DIR}"/scripts/*.sh; do
     [[ -f "$script" ]] && cp "$script" "${VAULT}/bin/"
 done
 [[ -f "${SCRIPT_DIR}/clawshell.py" ]] && cp "${SCRIPT_DIR}/clawshell.py" "${VAULT}/bin/"
-chown -R occlawshell:occlawshell "${VAULT}/bin/"
+# Scripts in bin/ are owned by root to prevent privilege escalation via sudoers.
+# occlawshell can read/execute but not modify them.
+chown -R root:root "${VAULT}/bin/"
 chmod 755 "${VAULT}/bin/"*.sh
 chmod 644 "${VAULT}/bin/clawshell.py" 2>/dev/null || true
-ok "Scripts deployed"
+ok "Scripts deployed (root-owned, occlawshell can execute)"
 
 # Generate start-gateway.sh
 OPENCLAW_NODE_DIR=$(dirname "$OPENCLAW_BIN" 2>/dev/null || true)
@@ -287,7 +289,7 @@ if [[ -n "$OPENCLAW_NODE_DIR" ]]; then
 export PATH="${OPENCLAW_NODE_DIR}:\$PATH"
 exec openclaw gateway --port "\${OPENCLAW_GATEWAY_PORT:-18789}"
 GWEOF
-    chown occlawshell:occlawshell "${VAULT}/bin/start-gateway.sh"
+    chown root:root "${VAULT}/bin/start-gateway.sh"
     chmod 755 "${VAULT}/bin/start-gateway.sh"
     ok "Generated start-gateway.sh"
 else
@@ -319,6 +321,8 @@ ok "ACLs configured"
 # Sudoers
 cat > /etc/sudoers.d/occlawshell << 'SUDEOF'
 occlawshell ALL=(root) NOPASSWD: /usr/bin/systemctl restart openclaw-gateway.service
+occlawshell ALL=(root) NOPASSWD: /usr/bin/systemctl stop openclaw-gateway.service
+occlawshell ALL=(root) NOPASSWD: /usr/bin/systemctl kill --signal=SIGKILL openclaw-gateway.service
 occlawshell ALL=(root) NOPASSWD: /usr/bin/systemctl start oc-identity-lock.service
 occlawshell ALL=(root) NOPASSWD: /usr/bin/systemctl start oc-identity-unlock.service
 occlawshell ALL=(root) NOPASSWD: /var/lib/occlawshell/bin/auto-recover.sh

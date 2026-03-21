@@ -185,10 +185,12 @@ if [[ -f "${SCRIPT_DIR}/clawshell.py" ]]; then
 else
     echo "  ⊘ clawshell.py not found in ${SCRIPT_DIR}"
 fi
-chown -R occlawshell:occlawshell "${VAULT}/bin/"
+# Scripts in bin/ are owned by root to prevent privilege escalation via sudoers.
+# occlawshell can read/execute but not modify them.
+chown -R root:root "${VAULT}/bin/"
 chmod 755 "${VAULT}/bin/"*.sh
 chmod 644 "${VAULT}/bin/clawshell.py" 2>/dev/null || true
-echo "  ✓ All scripts deployed"
+echo "  ✓ All scripts deployed (root-owned, occlawshell can execute)"
 
 # Generate gateway start script (uses detected paths, avoids hardcoding)
 if [[ -n "${OPENCLAW_NODE_DIR:-}" ]]; then
@@ -199,7 +201,7 @@ if [[ -n "${OPENCLAW_NODE_DIR:-}" ]]; then
 export PATH="${OPENCLAW_NODE_DIR}:\$PATH"
 exec openclaw gateway --port "\${OPENCLAW_GATEWAY_PORT:-18789}"
 GWEOF
-    chown occlawshell:occlawshell "${VAULT}/bin/start-gateway.sh"
+    chown root:root "${VAULT}/bin/start-gateway.sh"
     chmod 755 "${VAULT}/bin/start-gateway.sh"
     echo "  ✓ Generated start-gateway.sh (node: ${OPENCLAW_NODE_DIR})"
 else
@@ -233,6 +235,8 @@ SUDOERS_FILE="/etc/sudoers.d/occlawshell"
 cat > "$SUDOERS_FILE" << 'SUDEOF'
 # ClawShell: narrowly scoped privileged operations
 occlawshell ALL=(root) NOPASSWD: /usr/bin/systemctl restart openclaw-gateway.service
+occlawshell ALL=(root) NOPASSWD: /usr/bin/systemctl stop openclaw-gateway.service
+occlawshell ALL=(root) NOPASSWD: /usr/bin/systemctl kill --signal=SIGKILL openclaw-gateway.service
 occlawshell ALL=(root) NOPASSWD: /usr/bin/systemctl start oc-identity-lock.service
 occlawshell ALL=(root) NOPASSWD: /usr/bin/systemctl start oc-identity-unlock.service
 occlawshell ALL=(root) NOPASSWD: /var/lib/occlawshell/bin/auto-recover.sh

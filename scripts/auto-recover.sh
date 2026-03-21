@@ -22,6 +22,18 @@ AGENT_USER="${AGENT_USER:-ocagent}"
 OPENCLAW_DIR=$(grep '^OPENCLAW_DIR=' "${ENV_FILE}" 2>/dev/null | cut -d= -f2)
 OPENCLAW_DIR="${OPENCLAW_DIR:-/home/${AGENT_USER}/.openclaw}"
 
+# Validate AGENT_USER: must be a valid Unix username
+if [[ ! "$AGENT_USER" =~ ^[a-z_][a-z0-9_-]*$ ]]; then
+    echo "FATAL: Invalid AGENT_USER='${AGENT_USER}'" >&2
+    exit 1
+fi
+# Validate OPENCLAW_DIR: must be absolute, no '..' components, must exist
+OPENCLAW_DIR=$(realpath -m "$OPENCLAW_DIR" 2>/dev/null)
+if [[ ! "$OPENCLAW_DIR" =~ ^/home/ || "$OPENCLAW_DIR" == *..* ]]; then
+    echo "FATAL: Invalid OPENCLAW_DIR='${OPENCLAW_DIR}'" >&2
+    exit 1
+fi
+
 GATEWAY_SERVICE="openclaw-gateway.service"
 TS=$(date +%Y%m%d-%H%M%S)
 
@@ -68,7 +80,7 @@ log "Emergency snapshot saved: $EMERGENCY_DIR"
 # ── Step 3: Restore SQLite ──
 if [[ -f "$LKG/main.sqlite" ]]; then
     cp -p "$LKG/main.sqlite" "${OPENCLAW_DIR}/memory/main.sqlite"
-    chown ${AGENT_USER}:${AGENT_USER} "${OPENCLAW_DIR}/memory/main.sqlite"
+    chown "${AGENT_USER}:${AGENT_USER}" "${OPENCLAW_DIR}/memory/main.sqlite"
     chmod 600 "${OPENCLAW_DIR}/memory/main.sqlite"
     log "SQLite restored from LKG"
 fi
@@ -76,14 +88,14 @@ fi
 # ── Step 4: Restore MEMORY.md ──
 if [[ -f "$LKG/MEMORY.md" ]]; then
     cp -p "$LKG/MEMORY.md" "${OPENCLAW_DIR}/workspace/MEMORY.md"
-    chown ${AGENT_USER}:${AGENT_USER} "${OPENCLAW_DIR}/workspace/MEMORY.md"
+    chown "${AGENT_USER}:${AGENT_USER}" "${OPENCLAW_DIR}/workspace/MEMORY.md"
     log "MEMORY.md restored from LKG"
 fi
 
 # ── Step 5: Restore memory directory ──
 if [[ -d "$LKG/memory" ]]; then
     rsync -a --delete "$LKG/memory/" "${OPENCLAW_DIR}/workspace/memory/"
-    chown -R ${AGENT_USER}:${AGENT_USER} "${OPENCLAW_DIR}/workspace/memory/"
+    chown -R "${AGENT_USER}:${AGENT_USER}" "${OPENCLAW_DIR}/workspace/memory/"
     log "memory/ restored from LKG"
 fi
 

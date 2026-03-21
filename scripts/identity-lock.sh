@@ -11,6 +11,12 @@ AUDIT_LOG="/var/lib/occlawshell/audit/alerts.log"
 
 OPENCLAW_DIR=$(grep -oP '^OPENCLAW_DIR=\K.+' "$ENV_FILE" 2>/dev/null || true)
 OPENCLAW_DIR="${OPENCLAW_DIR:-/home/ocagent/.openclaw}"
+# Validate OPENCLAW_DIR: must be absolute, under /home/, no '..' components
+OPENCLAW_DIR=$(realpath -m "$OPENCLAW_DIR" 2>/dev/null)
+if [[ ! "$OPENCLAW_DIR" =~ ^/home/ || "$OPENCLAW_DIR" == *..* ]]; then
+    echo "FATAL: Invalid OPENCLAW_DIR='${OPENCLAW_DIR}'" >&2
+    exit 1
+fi
 WORKSPACE="${OPENCLAW_DIR}/workspace"
 
 IDENTITY_FILES=(

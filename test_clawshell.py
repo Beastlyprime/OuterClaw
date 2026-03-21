@@ -519,42 +519,35 @@ class TestStopGateway(unittest.TestCase):
         msg = stop_gateway()
         self.assertIn("Stop failed", msg)
 
-    @patch("clawshell.Path")
-    @patch("clawshell.find_gateway_pid", return_value=42)
-    @patch("clawshell.subprocess.run")
-    def test_escalates_to_sigkill_on_timeout(self, mock_run, mock_find_pid,
-                                              mock_path):
-        # First call (systemctl stop) times out, second (kill -9) succeeds
-        mock_run.side_effect = [
-            subprocess.TimeoutExpired("systemctl", 15),
-            MagicMock(returncode=0),
-        ]
-        mock_path.return_value.exists.return_value = False  # PID gone after kill
-        msg = stop_gateway()
-        self.assertIn("force-killed", msg)
-        self.assertIn("42", msg)
-        self.assertEqual(mock_run.call_count, 2)
-        # Verify SIGKILL was sent
-        kill_call = mock_run.call_args_list[1]
-        self.assertIn("-9", kill_call[0][0])
-
     @patch("clawshell.find_gateway_pid", return_value=None)
     @patch("clawshell.subprocess.run")
-    def test_escalation_pid_already_gone(self, mock_run, mock_find_pid):
-        mock_run.side_effect = subprocess.TimeoutExpired("systemctl", 15)
-        msg = stop_gateway()
-        self.assertIn("already stopped", msg)
-
-    @patch("clawshell.Path")
-    @patch("clawshell.find_gateway_pid", return_value=42)
-    @patch("clawshell.subprocess.run")
-    def test_escalation_sigkill_process_persists(self, mock_run, mock_find_pid,
-                                                  mock_path):
+    def test_escalates_to_sigkill_on_timeout(self, mock_run, mock_find_pid):
+        # First call (systemctl stop) times out, second (systemctl kill --signal=SIGKILL) succeeds
         mock_run.side_effect = [
             subprocess.TimeoutExpired("systemctl", 15),
             MagicMock(returncode=0),
         ]
-        mock_path.return_value.exists.return_value = True  # PID still there
+        msg = stop_gateway()
+        self.assertIn("force-killed", msg)
+        self.assertEqual(mock_run.call_count, 2)
+        # Verify SIGKILL was sent via systemctl kill
+        kill_call = mock_run.call_args_list[1]
+        self.assertIn("--signal=SIGKILL", kill_call[0][0])
+
+    @patch("clawshell.subprocess.run")
+    def test_escalation_sigkill_fails(self, mock_run):
+        # Both systemctl stop and systemctl kill time out
+        mock_run.side_effect = subprocess.TimeoutExpired("systemctl", 15)
+        msg = stop_gateway()
+        self.assertIn("Force-kill failed", msg)
+
+    @patch("clawshell.find_gateway_pid", return_value=42)
+    @patch("clawshell.subprocess.run")
+    def test_escalation_sigkill_process_persists(self, mock_run, mock_find_pid):
+        mock_run.side_effect = [
+            subprocess.TimeoutExpired("systemctl", 15),
+            MagicMock(returncode=0),
+        ]
         msg = stop_gateway()
         self.assertIn("still present", msg)
 

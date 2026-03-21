@@ -7,6 +7,10 @@ set -euo pipefail
 ENV_FILE="/var/lib/occlawshell/config/clawshell.env"
 OPENCLAW_DIR=$(grep '^OPENCLAW_DIR=' "${ENV_FILE}" 2>/dev/null | cut -d= -f2)
 OPENCLAW_DIR="${OPENCLAW_DIR:-/home/ocagent/.openclaw}"
+OPENCLAW_DIR=$(realpath -m "$OPENCLAW_DIR" 2>/dev/null)
+if [[ ! "$OPENCLAW_DIR" =~ ^/home/ ]]; then
+    echo "FATAL: Invalid OPENCLAW_DIR='${OPENCLAW_DIR}'" >&2; exit 1
+fi
 
 SRC_WORKSPACE="${OPENCLAW_DIR}/workspace"
 SRC_CONFIG="${OPENCLAW_DIR}/openclaw.json"

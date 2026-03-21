@@ -24,6 +24,7 @@ import json
 import logging
 import os
 import queue
+import re
 import select
 import signal
 import socket
@@ -69,6 +70,8 @@ IDENTITY_UNLOCK_TIMEOUT = 600  # 10 minutes auto-relock
 SESSIONS_URL = f"http://127.0.0.1:{GATEWAY_PORT}/sessions"
 SESSIONS_TIMEOUT = 10  # HTTP timeout for session API calls
 KILL_GRACEFUL_TIMEOUT = 15  # Seconds for systemctl stop before escalating to SIGKILL
+MAX_RESPONSE_BYTES = 1_048_576  # 1MB — cap on HTTP response body reads
+_SESSION_ID_RE = re.compile(r"^[a-zA-Z0-9_-]+$")
 
 # Config file monitoring
 OPENCLAW_DIR = os.environ.get("OPENCLAW_DIR", "/home/ocagent/.openclaw")
@@ -273,22 +276,20 @@ def stop_gateway() -> str:
     except OSError as e:
         logging.error("systemctl stop failed: %s", e)
 
-    # Step 2: escalate — find PID and SIGKILL
-    pid = find_gateway_pid()
-    if pid is None:
-        return "Gateway already stopped (no PID found after timeout)."
-
+    # Step 2: escalate — use 'systemctl kill --signal=SIGKILL' which is
+    # covered by the existing sudoers entry for the gateway service.
+    # (sudo kill -9 is NOT in sudoers and would be denied.)
     try:
-        subprocess.run(
-            ["sudo", "kill", "-9", str(pid)],
-            timeout=5, capture_output=True, text=True,
+        result = subprocess.run(
+            ["sudo", "systemctl", "kill", "--signal=SIGKILL", GATEWAY_SERVICE],
+            timeout=10, capture_output=True, text=True,
         )
-        # Verify it's gone
         time.sleep(0.5)
-        if not Path(f"/proc/{pid}").exists():
-            return (f"Gateway force-killed (PID {pid}) after "
-                    f"systemctl stop timed out.")
-        return (f"SIGKILL sent to PID {pid} but process still present. "
+        pid = find_gateway_pid()
+        if pid is None:
+            return ("Gateway force-killed (SIGKILL via systemctl) after "
+                    "graceful stop timed out.")
+        return ("SIGKILL sent via systemctl but process still present. "
                 "Manual intervention may be needed.")
     except (subprocess.TimeoutExpired, OSError) as e:
         return f"Force-kill failed: {e}. Manual intervention required."
@@ -299,7 +300,7 @@ def list_sessions() -> Optional[list]:
     try:
         req = Request(SESSIONS_URL, method="GET")
         resp = urlopen(req, timeout=SESSIONS_TIMEOUT)
-        data = json.loads(resp.read().decode())
+        data = json.loads(resp.read(MAX_RESPONSE_BYTES).decode())
         if isinstance(data, list):
             return data
         # Handle {"sessions": [...]} wrapper
@@ -312,6 +313,8 @@ def list_sessions() -> Optional[list]:
 
 def kill_session(session_id: str) -> tuple:
     """Kill a specific session via OpenClaw API. Returns (success, message)."""
+    if not _SESSION_ID_RE.match(session_id):
+        return (False, f"Invalid session_id: must be alphanumeric, dash, or underscore.")
     url = f"{SESSIONS_URL}/{session_id}"
     try:
         req = Request(url, method="DELETE")
@@ -405,8 +408,10 @@ class ConfigWatcher:
 
         now = time.time()
         offset = 0
-        while offset < len(buf):
+        while offset + self.EVENT_HEADER_SIZE <= len(buf):
             wd, mask, _, name_len = struct.unpack_from("iIII", buf, offset)
+            if offset + self.EVENT_HEADER_SIZE + name_len > len(buf):
+                break
             offset += self.EVENT_HEADER_SIZE + name_len
             path = self._wd_to_path.get(wd, f"unknown(wd={wd})")
 
@@ -471,12 +476,14 @@ class TelegramBot:
 
     POLL_TIMEOUT = 15
     ERROR_BACKOFF = 30
+    DESTRUCTIVE_COOLDOWN = 60  # seconds between destructive commands
 
     def __init__(self, token: str, chat_id: str,
                  command_queue: "queue.Queue",
                  get_status_fn):
         self._token = token
         self._chat_id = str(chat_id)
+        self._last_destructive_cmd: float = 0.0
         self._base_url = f"https://api.telegram.org/bot{token}"
         self._offset = 0
         self._queue = command_queue
@@ -501,7 +508,7 @@ class TelegramBot:
             req.add_header("Content-Type", "application/json")
         try:
             resp = urlopen(req, timeout=timeout or 30)
-            result = json.loads(resp.read().decode())
+            result = json.loads(resp.read(MAX_RESPONSE_BYTES).decode())
             if result.get("ok"):
                 return result.get("result")
         except Exception as e:
@@ -554,6 +561,18 @@ class TelegramBot:
 
         cmd = text.split()[0].lower().split("@")[0]  # strip @botname
         logging.info("TelegramBot: command '%s' from %s", cmd, username)
+
+        # Rate-limit destructive commands
+        destructive_cmds = {"/restart", "/kill", "/kill_session", "/unlock_identity"}
+        if cmd in destructive_cmds:
+            now = time.time()
+            elapsed = now - self._last_destructive_cmd
+            if elapsed < self.DESTRUCTIVE_COOLDOWN:
+                remaining = int(self.DESTRUCTIVE_COOLDOWN - elapsed)
+                self.send_message(
+                    f"Rate limited — wait {remaining}s before retrying.")
+                return
+            self._last_destructive_cmd = now
 
         if cmd == "/help":
             self.send_message(
@@ -689,10 +708,8 @@ class ClawShell:
     def _handle_signal(self, signum, frame):
         logging.info("Received signal %d, shutting down", signum)
         self.running = False
-        if self._tg_bot:
-            self._tg_bot.stop()
-        if self._config_watcher:
-            self._config_watcher.close()
+        # Cleanup (close, stop) is handled after the main loop exits to avoid
+        # races with os.read()/select() on the inotify fd and network calls.
 
     def _classify(self, metrics: Optional[ProcessMetrics],
                   http_ok: bool) -> State:
