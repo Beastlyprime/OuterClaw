@@ -16,7 +16,7 @@ import clawshell
 from clawshell import (
     State, ProcessMetrics, ClawShell, find_gateway_pid, collect_proc,
     check_health, send_alert, write_proc_json, sd_notify,
-    ConfigWatcher, TelegramBot, list_sessions, kill_session,
+    ConfigWatcher, TelegramBot, list_sessions, kill_session, stop_gateway,
 )
 
 # ── ProcessMetrics and Enum Tests ──────────────────────────────
@@ -501,6 +501,62 @@ class TestProcessManagement(unittest.TestCase):
         ok, msg = kill_session("sess-999")
         self.assertFalse(ok)
         self.assertIn("Failed", msg)
+
+
+class TestStopGateway(unittest.TestCase):
+    """Tests for stop_gateway() escalation logic."""
+
+    @patch("clawshell.subprocess.run")
+    def test_graceful_stop_success(self, mock_run):
+        mock_run.return_value = MagicMock(returncode=0)
+        msg = stop_gateway()
+        self.assertIn("stopped successfully", msg)
+        mock_run.assert_called_once()
+
+    @patch("clawshell.subprocess.run")
+    def test_graceful_stop_error(self, mock_run):
+        mock_run.return_value = MagicMock(returncode=1, stderr="unit not found")
+        msg = stop_gateway()
+        self.assertIn("Stop failed", msg)
+
+    @patch("clawshell.Path")
+    @patch("clawshell.find_gateway_pid", return_value=42)
+    @patch("clawshell.subprocess.run")
+    def test_escalates_to_sigkill_on_timeout(self, mock_run, mock_find_pid,
+                                              mock_path):
+        # First call (systemctl stop) times out, second (kill -9) succeeds
+        mock_run.side_effect = [
+            subprocess.TimeoutExpired("systemctl", 15),
+            MagicMock(returncode=0),
+        ]
+        mock_path.return_value.exists.return_value = False  # PID gone after kill
+        msg = stop_gateway()
+        self.assertIn("force-killed", msg)
+        self.assertIn("42", msg)
+        self.assertEqual(mock_run.call_count, 2)
+        # Verify SIGKILL was sent
+        kill_call = mock_run.call_args_list[1]
+        self.assertIn("-9", kill_call[0][0])
+
+    @patch("clawshell.find_gateway_pid", return_value=None)
+    @patch("clawshell.subprocess.run")
+    def test_escalation_pid_already_gone(self, mock_run, mock_find_pid):
+        mock_run.side_effect = subprocess.TimeoutExpired("systemctl", 15)
+        msg = stop_gateway()
+        self.assertIn("already stopped", msg)
+
+    @patch("clawshell.Path")
+    @patch("clawshell.find_gateway_pid", return_value=42)
+    @patch("clawshell.subprocess.run")
+    def test_escalation_sigkill_process_persists(self, mock_run, mock_find_pid,
+                                                  mock_path):
+        mock_run.side_effect = [
+            subprocess.TimeoutExpired("systemctl", 15),
+            MagicMock(returncode=0),
+        ]
+        mock_path.return_value.exists.return_value = True  # PID still there
+        msg = stop_gateway()
+        self.assertIn("still present", msg)
 
 
 if __name__ == "__main__":

@@ -68,6 +68,7 @@ IDENTITY_UNLOCK_TIMEOUT = 600  # 10 minutes auto-relock
 # Process management
 SESSIONS_URL = f"http://127.0.0.1:{GATEWAY_PORT}/sessions"
 SESSIONS_TIMEOUT = 10  # HTTP timeout for session API calls
+KILL_GRACEFUL_TIMEOUT = 15  # Seconds for systemctl stop before escalating to SIGKILL
 
 # Config file monitoring
 OPENCLAW_DIR = os.environ.get("OPENCLAW_DIR", "/home/ocagent/.openclaw")
@@ -245,6 +246,52 @@ def check_health() -> bool:
         return resp.status == 200
     except Exception:
         return False
+
+
+def stop_gateway() -> str:
+    """Stop the gateway with escalation: systemctl stop → SIGKILL fallback.
+
+    Under system load, systemctl stop may hang because the service sends
+    SIGTERM and waits for graceful shutdown.  If the process is the *cause*
+    of the load, it may never exit gracefully.  We therefore:
+      1. Try `systemctl stop` with a short timeout.
+      2. If that times out, find the PID and send SIGKILL directly.
+    """
+    # Step 1: graceful stop
+    try:
+        result = subprocess.run(
+            ["sudo", "systemctl", "stop", GATEWAY_SERVICE],
+            timeout=KILL_GRACEFUL_TIMEOUT, capture_output=True, text=True,
+        )
+        if result.returncode == 0:
+            return "Gateway stopped successfully."
+        # systemctl returned error but didn't timeout — report it
+        return f"Stop failed: {result.stderr[:200]}"
+    except subprocess.TimeoutExpired:
+        logging.warning("systemctl stop timed out after %ds, "
+                        "escalating to SIGKILL", KILL_GRACEFUL_TIMEOUT)
+    except OSError as e:
+        logging.error("systemctl stop failed: %s", e)
+
+    # Step 2: escalate — find PID and SIGKILL
+    pid = find_gateway_pid()
+    if pid is None:
+        return "Gateway already stopped (no PID found after timeout)."
+
+    try:
+        subprocess.run(
+            ["sudo", "kill", "-9", str(pid)],
+            timeout=5, capture_output=True, text=True,
+        )
+        # Verify it's gone
+        time.sleep(0.5)
+        if not Path(f"/proc/{pid}").exists():
+            return (f"Gateway force-killed (PID {pid}) after "
+                    f"systemctl stop timed out.")
+        return (f"SIGKILL sent to PID {pid} but process still present. "
+                "Manual intervention may be needed.")
+    except (subprocess.TimeoutExpired, OSError) as e:
+        return f"Force-kill failed: {e}. Manual intervention required."
 
 
 def list_sessions() -> Optional[list]:
@@ -910,16 +957,8 @@ class ClawShell:
                 logging.info("Telegram: kill requested by %s", user)
                 send_alert("WARNING",
                            f"Gateway STOP via Telegram by {user}")
-                try:
-                    result = subprocess.run(
-                        ["sudo", "systemctl", "stop", GATEWAY_SERVICE],
-                        timeout=30, capture_output=True, text=True,
-                    )
-                    msg = ("Gateway stopped successfully."
-                           if result.returncode == 0
-                           else f"Stop failed: {result.stderr[:200]}")
-                except (subprocess.TimeoutExpired, OSError) as e:
-                    msg = f"Stop error: {e}"
+                msg = stop_gateway()
+                logging.info("Kill result: %s", msg)
                 if self._tg_bot:
                     self._tg_bot.send_message(msg)
 
@@ -1225,20 +1264,11 @@ def show_status() -> None:
 # ── Entry Point ────────────────────────────────────────────────
 
 def _kill_gateway() -> None:
-    """Stop the OpenClaw gateway service."""
+    """Stop the OpenClaw gateway service with SIGKILL escalation."""
     print("Stopping gateway...")
-    try:
-        result = subprocess.run(
-            ["sudo", "systemctl", "stop", GATEWAY_SERVICE],
-            timeout=30, text=True,
-        )
-        if result.returncode == 0:
-            print("Gateway stopped successfully.")
-        else:
-            print("Failed to stop gateway.", file=sys.stderr)
-            sys.exit(1)
-    except (subprocess.TimeoutExpired, OSError) as e:
-        print(f"Error: {e}", file=sys.stderr)
+    msg = stop_gateway()
+    print(msg)
+    if "failed" in msg.lower() or "intervention" in msg.lower():
         sys.exit(1)
 
 
