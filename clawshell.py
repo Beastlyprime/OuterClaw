@@ -74,7 +74,9 @@ MAX_RESPONSE_BYTES = 1_048_576  # 1MB — cap on HTTP response body reads
 _SESSION_ID_RE = re.compile(r"^[a-zA-Z0-9_-]+$")
 
 # Config file monitoring
-OPENCLAW_DIR = os.environ.get("OPENCLAW_DIR", "/home/ocagent/.openclaw")
+OPENCLAW_DIR = os.path.realpath(os.environ.get("OPENCLAW_DIR", "/home/ocagent/.openclaw"))
+if not OPENCLAW_DIR.startswith("/home/"):
+    raise SystemExit(f"FATAL: Invalid OPENCLAW_DIR={OPENCLAW_DIR} (must be under /home/)")
 WATCHED_FILES = [
     os.path.join(OPENCLAW_DIR, "workspace", "SOUL.md"),
     os.path.join(OPENCLAW_DIR, "workspace", "AGENTS.md"),
@@ -104,6 +106,12 @@ if not TG_TOKEN or not TG_CHAT:
             TG_CHAT = str(_af[0]) if _af else ""
     except (OSError, json.JSONDecodeError, PermissionError):
         pass
+
+# Validate TG_TOKEN format to prevent URL injection (tokens are digits:alphanumeric)
+_TG_TOKEN_RE = re.compile(r"^\d+:[a-zA-Z0-9_-]+$")
+if TG_TOKEN and not _TG_TOKEN_RE.match(TG_TOKEN):
+    logging.warning("Invalid TG_TOKEN format, disabling Telegram")
+    TG_TOKEN = ""
 
 VERSION = "1.0"
 LOG_FORMAT = "%(asctime)s [%(levelname)s] %(message)s"

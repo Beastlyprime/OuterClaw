@@ -1,5 +1,6 @@
 import unittest
 import os
+import queue
 import struct
 import sys
 import json
@@ -550,6 +551,91 @@ class TestStopGateway(unittest.TestCase):
         ]
         msg = stop_gateway()
         self.assertIn("still present", msg)
+
+
+class TestSessionIdValidation(unittest.TestCase):
+    """Security tests for session_id input validation."""
+
+    def test_valid_session_ids(self):
+        """Normal session IDs should be accepted."""
+        for sid in ["abc123", "session-1", "my_session", "A-Z_0-9"]:
+            ok, msg = kill_session(sid)
+            # Will fail with connection error but should NOT fail validation
+            self.assertNotIn("Invalid session_id", msg, f"Rejected valid id: {sid}")
+
+    def test_path_traversal_rejected(self):
+        ok, msg = kill_session("../../admin/reset")
+        self.assertFalse(ok)
+        self.assertIn("Invalid session_id", msg)
+
+    def test_url_injection_rejected(self):
+        ok, msg = kill_session("foo?bar=baz#fragment")
+        self.assertFalse(ok)
+        self.assertIn("Invalid session_id", msg)
+
+    def test_crlf_injection_rejected(self):
+        ok, msg = kill_session("foo\r\nHost: evil.com")
+        self.assertFalse(ok)
+        self.assertIn("Invalid session_id", msg)
+
+    def test_empty_rejected(self):
+        ok, msg = kill_session("")
+        self.assertFalse(ok)
+        self.assertIn("Invalid session_id", msg)
+
+    def test_slash_rejected(self):
+        ok, msg = kill_session("foo/bar")
+        self.assertFalse(ok)
+        self.assertIn("Invalid session_id", msg)
+
+    def test_space_rejected(self):
+        ok, msg = kill_session("foo bar")
+        self.assertFalse(ok)
+        self.assertIn("Invalid session_id", msg)
+
+
+class TestTelegramRateLimiting(unittest.TestCase):
+    """Test rate limiting on destructive Telegram commands."""
+
+    def setUp(self):
+        self.q = queue.Queue()
+        self.bot = TelegramBot("123:fake", "12345", self.q, lambda: {})
+
+    @patch.object(TelegramBot, 'send_message', return_value=True)
+    def test_second_destructive_cmd_blocked(self, mock_send):
+        """A second destructive command within 60s should be rate-limited."""
+        # Simulate first /restart command
+        self.bot._last_destructive_cmd = time.time()
+        update = {"message": {"text": "/restart", "chat": {"id": "12345"},
+                               "from": {"username": "admin"}}}
+        self.bot._handle_update(update)
+        # Should send rate limit message, NOT queue the command
+        mock_send.assert_called()
+        self.assertIn("Rate limited", mock_send.call_args[0][0])
+        self.assertTrue(self.q.empty())
+
+    @patch.object(TelegramBot, 'send_message', return_value=True)
+    def test_destructive_cmd_allowed_after_cooldown(self, mock_send):
+        """A destructive command should be allowed after cooldown expires."""
+        self.bot._last_destructive_cmd = time.time() - 61  # 61s ago
+        update = {"message": {"text": "/restart", "chat": {"id": "12345"},
+                               "from": {"username": "admin"}}}
+        self.bot._handle_update(update)
+        # Should queue the restart, not rate-limit
+        self.assertFalse(self.q.empty())
+        cmd = self.q.get()
+        self.assertEqual(cmd["action"], "restart")
+
+    @patch.object(TelegramBot, 'send_message', return_value=True)
+    def test_readonly_cmds_not_rate_limited(self, mock_send):
+        """Non-destructive commands like /help should not be rate-limited."""
+        self.bot._last_destructive_cmd = time.time()  # just now
+        update = {"message": {"text": "/help", "chat": {"id": "12345"},
+                               "from": {"username": "admin"}}}
+        self.bot._handle_update(update)
+        # Should get help response, not rate limit
+        self.assertTrue(mock_send.called)
+        self.assertNotIn("Rate limited", mock_send.call_args[0][0])
 
 
 if __name__ == "__main__":

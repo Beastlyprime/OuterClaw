@@ -50,8 +50,8 @@ fi
 echo "[$TS] [$LEVEL] $MESSAGE" >> "$LOG"
 
 # Send via Telegram if configured
-# Validate TG_CHAT is numeric (positive or negative for group chats)
-if [[ -n "$TG_TOKEN" && -n "$TG_CHAT" && "$TG_CHAT" =~ ^-?[0-9]+$ ]]; then
+# Validate TG_TOKEN format (digits:alphanumeric) and TG_CHAT is numeric
+if [[ -n "$TG_TOKEN" && -n "$TG_CHAT" && "$TG_TOKEN" =~ ^[0-9]+:[a-zA-Z0-9_-]+$ && "$TG_CHAT" =~ ^-?[0-9]+$ ]]; then
     case "$LEVEL" in
         CRITICAL) EMOJI="🚨" ;;
         WARNING)  EMOJI="⚠️" ;;
@@ -65,7 +65,7 @@ if [[ -n "$TG_TOKEN" && -n "$TG_CHAT" && "$TG_CHAT" =~ ^-?[0-9]+$ ]]; then
     curl -s -X POST \
         "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" \
         -H "Content-Type: application/json" \
-        -d "{\"chat_id\":\"${TG_CHAT}\",\"text\":$(echo "$TEXT" | python3 -c 'import sys,json; print(json.dumps(sys.stdin.read()))'),\"parse_mode\":\"Markdown\"}" \
+        -d "{\"chat_id\":\"${TG_CHAT}\",\"text\":$(printf '%s' "$TEXT" | python3 -c 'import sys,json; print(json.dumps(sys.stdin.read()))'),\"parse_mode\":\"Markdown\"}" \
         --max-time 10 \
         > /dev/null 2>&1 || echo "[$TS] [ALERT-FAIL] Telegram send failed" >> "$LOG"
 fi

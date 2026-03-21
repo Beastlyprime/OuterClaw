@@ -6,6 +6,10 @@ set -uo pipefail
 # No -e: collect as much as possible even if individual commands fail
 
 UNIT_NAME="${1:-openclaw-gateway}"
+# Validate UNIT_NAME to prevent path traversal (script runs as root)
+if [[ ! "$UNIT_NAME" =~ ^[a-zA-Z0-9_.-]+$ ]]; then
+    echo "FATAL: Invalid UNIT_NAME='${UNIT_NAME}'" >&2; exit 1
+fi
 TS=$(date +%Y%m%d-%H%M%S)
 PM_DIR="/var/lib/occlawshell/postmortem/${TS}-${UNIT_NAME}"
 ALERT="/var/lib/occlawshell/bin/alert.sh"
@@ -19,7 +23,7 @@ fi
 
 # Helper: redact secrets from environment variables
 redact_env() {
-    sed -E 's/(TOKEN|KEY|SECRET|PASSWORD|APIKEY|API_KEY|CREDENTIAL)=[^ ]*/\1=<REDACTED>/gi'
+    sed -E 's/(TOKEN|KEY|SECRET|PASSWORD|APIKEY|API_KEY|CREDENTIAL|PRIVATE|AUTH|JWT|DSN|_URL|COOKIE|SESSION)=[^ ]*/\1=<REDACTED>/gi'
 }
 
 # ═══════════════════════════════════════════════════════════════
