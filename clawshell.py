@@ -46,6 +46,8 @@ TICK_INTERVAL = 1          # Main loop tick (seconds)
 COLLECT_INTERVAL = 30      # /proc collection interval (seconds)
 
 GATEWAY_PORT = int(os.environ.get("GATEWAY_PORT", "18789"))
+if not (1 <= GATEWAY_PORT <= 65535):
+    raise SystemExit(f"FATAL: Invalid GATEWAY_PORT={GATEWAY_PORT}")
 HEALTH_URL = f"http://127.0.0.1:{GATEWAY_PORT}/health"
 HEALTH_TIMEOUT = 5         # HTTP timeout (seconds)
 

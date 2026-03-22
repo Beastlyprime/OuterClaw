@@ -60,20 +60,20 @@ PID=$(systemctl show "$UNIT_NAME.service" --property=ExecMainPID --value 2>/dev/
 if [[ -n "$PID" && "$PID" != "0" && -d "/proc/$PID" ]]; then
     echo "PID $PID still alive, collecting /proc data..." > "$PM_DIR/04-proc-status.txt"
     echo "" >> "$PM_DIR/04-proc-status.txt"
-    cat /proc/$PID/status >> "$PM_DIR/04-proc-status.txt" 2>/dev/null || true
+    cat "/proc/$PID/status" >> "$PM_DIR/04-proc-status.txt" 2>/dev/null || true
 
-    cat /proc/$PID/io > "$PM_DIR/05-proc-io.txt" 2>/dev/null || true
-    cat /proc/$PID/stack > "$PM_DIR/06-proc-kernel-stack.txt" 2>/dev/null || true
-    cat /proc/$PID/wchan > "$PM_DIR/07-proc-wchan.txt" 2>/dev/null || true
-    cat /proc/$PID/cmdline | tr '\0' ' ' > "$PM_DIR/08-proc-cmdline.txt" 2>/dev/null || true
-    cat /proc/$PID/environ | tr '\0' '\n' | redact_env > "$PM_DIR/09-proc-environ.txt" 2>/dev/null || true
-    cat /proc/$PID/oom_score > "$PM_DIR/10-proc-oom-score.txt" 2>/dev/null || true
-    cat /proc/$PID/oom_score_adj > "$PM_DIR/10-proc-oom-score-adj.txt" 2>/dev/null || true
+    cat "/proc/$PID/io" > "$PM_DIR/05-proc-io.txt" 2>/dev/null || true
+    cat "/proc/$PID/stack" > "$PM_DIR/06-proc-kernel-stack.txt" 2>/dev/null || true
+    cat "/proc/$PID/wchan" > "$PM_DIR/07-proc-wchan.txt" 2>/dev/null || true
+    cat "/proc/$PID/cmdline" | tr '\0' ' ' > "$PM_DIR/08-proc-cmdline.txt" 2>/dev/null || true
+    cat "/proc/$PID/environ" | tr '\0' '\n' | redact_env > "$PM_DIR/09-proc-environ.txt" 2>/dev/null || true
+    cat "/proc/$PID/oom_score" > "$PM_DIR/10-proc-oom-score.txt" 2>/dev/null || true
+    cat "/proc/$PID/oom_score_adj" > "$PM_DIR/10-proc-oom-score-adj.txt" 2>/dev/null || true
 
     # File descriptors
-    ls -la /proc/$PID/fd/ > "$PM_DIR/11-proc-fd-list.txt" 2>/dev/null || true
+    ls -la "/proc/$PID/fd/" > "$PM_DIR/11-proc-fd-list.txt" 2>/dev/null || true
     wc -l "$PM_DIR/11-proc-fd-list.txt" 2>/dev/null | cut -d' ' -f1 > "$PM_DIR/11-proc-fd-count.txt" || true
-    readlink -f /proc/$PID/fd/* 2>/dev/null | sort | uniq -c | sort -rn \
+    readlink -f "/proc/$PID/fd/"* 2>/dev/null | sort | uniq -c | sort -rn \
         > "$PM_DIR/11-proc-fd-targets.txt" 2>/dev/null || true
 
     # Network connections
@@ -81,8 +81,8 @@ if [[ -n "$PID" && "$PID" != "0" && -d "/proc/$PID" ]]; then
     ss -tnp 2>/dev/null | grep "pid=$PID" >> "$PM_DIR/12-proc-sockets.txt" 2>/dev/null || true
 
     # cgroup memory & CPU stats
-    CGROUP_PATH=$(cat /proc/$PID/cgroup 2>/dev/null | head -1 | cut -d: -f3)
-    if [[ -n "$CGROUP_PATH" && -d "/sys/fs/cgroup${CGROUP_PATH}" ]]; then
+    CGROUP_PATH=$(cat "/proc/$PID/cgroup" 2>/dev/null | head -1 | cut -d: -f3)
+    if [[ -n "$CGROUP_PATH" && "$CGROUP_PATH" != *..* && -d "/sys/fs/cgroup${CGROUP_PATH}" ]]; then
         cat "/sys/fs/cgroup${CGROUP_PATH}/memory.stat" > "$PM_DIR/13-cgroup-memory-stat.txt" 2>/dev/null || true
         cat "/sys/fs/cgroup${CGROUP_PATH}/memory.current" > "$PM_DIR/13-cgroup-memory-current.txt" 2>/dev/null || true
         cat "/sys/fs/cgroup${CGROUP_PATH}/memory.peak" > "$PM_DIR/13-cgroup-memory-peak.txt" 2>/dev/null || true
@@ -198,7 +198,7 @@ chmod -R 700 "$PM_DIR"
     2>/dev/null || true
 
 # Prune old postmortems (keep 20)
-cd /var/lib/occlawshell/postmortem
-ls -1dt */ 2>/dev/null | tail -n +21 | xargs -r rm -rf
+cd /var/lib/occlawshell/postmortem || exit 0
+ls -1dt ./*/ 2>/dev/null | tail -n +21 | xargs -r rm -rf
 
 exit 0
