@@ -1,0 +1,30 @@
+# Ignore all by default
+*
+
+# ── Project files (whitelist) ──
+!.gitignore
+!LICENSE
+!README.md
+
+# Rust project
+!Cargo.toml
+!Cargo.lock
+!build.rs
+!src/
+!src/**
+!src/**/*.rs
+
+# Scripts
+!scripts/
+!scripts/*.sh
+
+# Tests
+!tests/
+!tests/**
+
+# CI/CD
+!.github/
+!.github/**
+
+# Cargo build output
+/target

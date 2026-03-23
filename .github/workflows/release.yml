@@ -1,0 +1,122 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-release:
+    name: Build (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+          - target: aarch64-unknown-linux-musl
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Install cross
+        run: cargo install cross --locked
+
+      - name: Build release binary
+        run: cross build --release --target ${{ matrix.target }}
+
+      - name: Strip binary
+        run: |
+          # cross-built binaries are already stripped via profile.release.strip = true
+          # Verify the binary exists
+          ls -lh target/${{ matrix.target }}/release/outerclaw
+
+      - name: Generate SHA-256 checksum
+        run: |
+          cd target/${{ matrix.target }}/release
+          sha256sum outerclaw > outerclaw.sha256
+
+      - name: Rename binary with target suffix
+        run: |
+          cp target/${{ matrix.target }}/release/outerclaw outerclaw-${{ matrix.target }}
+          cp target/${{ matrix.target }}/release/outerclaw.sha256 outerclaw-${{ matrix.target }}.sha256
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.target }}
+          path: |
+            outerclaw-${{ matrix.target }}
+            outerclaw-${{ matrix.target }}.sha256
+
+  create-release:
+    name: Create GitHub Release
+    needs: build-release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          pattern: release-*
+          merge-multiple: true
+
+      - name: List artifacts
+        run: ls -lhR artifacts/
+
+      - name: Generate release notes
+        id: notes
+        run: |
+          TAG="${GITHUB_REF#refs/tags/}"
+          # Find the previous tag
+          PREV_TAG=$(git tag --sort=-version:refname | grep -A1 "^${TAG}$" | tail -1)
+          if [ "$PREV_TAG" = "$TAG" ] || [ -z "$PREV_TAG" ]; then
+            # First release or no previous tag
+            RANGE="$TAG"
+            LOG=$(git log --oneline --no-decorate "$TAG" | head -50)
+          else
+            RANGE="${PREV_TAG}..${TAG}"
+            LOG=$(git log --oneline --no-decorate "$RANGE")
+          fi
+
+          {
+            echo "notes<<RELEASE_EOF"
+            echo "## What's Changed"
+            echo ""
+            echo "$LOG" | sed 's/^/- /'
+            echo ""
+            echo "## Checksums"
+            echo ""
+            echo '```'
+            cat artifacts/*.sha256
+            echo '```'
+            echo "RELEASE_EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          body: ${{ steps.notes.outputs.notes }}
+          files: |
+            artifacts/outerclaw-*
+          draft: false
+          prerelease: ${{ contains(github.ref, '-rc') || contains(github.ref, '-beta') || contains(github.ref, '-alpha') }}
