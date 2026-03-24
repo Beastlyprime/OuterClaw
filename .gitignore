@@ -22,6 +22,10 @@
 !tests/
 !tests/**
 
+# Docs & assets
+!docs/
+!docs/**
+
 # CI/CD
 !.github/
 !.github/**

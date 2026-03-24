@@ -1,10 +1,29 @@
-# OuterClaw
+<p align="center">
+  <img src="docs/assets/outerclaw-logo.png" alt="OuterClaw" width="180"/>
+</p>
 
-External security guardian for [OpenClaw](https://openclaw.ai). A single Rust binary that monitors your gateway, protects your data, and alerts you independently.
+<h1 align="center">OuterClaw</h1>
+
+<p align="center">
+  External security guardian for <a href="https://openclaw.ai">OpenClaw</a>.<br/>
+  <em>Always on. Every memory kept. Every heartbeat watched.</em>
+</p>
+
+<p align="center">
+  <a href="https://github.com/Beastlyprime/OuterClaw/releases"><img alt="Release" src="https://img.shields.io/github/v/release/Beastlyprime/OuterClaw?style=flat-square&color=1A3A5C"/></a>
+  <a href="https://github.com/Beastlyprime/OuterClaw/blob/main/LICENSE"><img alt="License" src="https://img.shields.io/badge/license-AGPL--3.0-blue?style=flat-square"/></a>
+  <a href="https://github.com/Beastlyprime/OuterClaw/actions"><img alt="CI" src="https://img.shields.io/github/actions/workflow/status/Beastlyprime/OuterClaw/ci.yml?style=flat-square&label=tests"/></a>
+  <a href="https://github.com/Beastlyprime/OuterClaw/stargazers"><img alt="Stars" src="https://img.shields.io/github/stars/Beastlyprime/OuterClaw?style=flat-square&color=E8732A"/></a>
+  <a href="https://github.com/Beastlyprime/OuterClaw/commits/main"><img alt="Last Commit" src="https://img.shields.io/github/last-commit/Beastlyprime/OuterClaw?style=flat-square"/></a>
+</p>
+
+---
+
+A single Rust binary (~3.4 MB) that monitors your OpenClaw gateway, protects your data, and alerts you independently -- running as a **separate process under a separate user**, so it keeps working even when OpenClaw doesn't.
 
 ## Why OuterClaw?
 
-OpenClaw can't detect when it's crashed, hung, or compromised. OuterClaw runs as a **separate process under a separate user**, so it keeps working even when OpenClaw doesn't.
+OpenClaw can't detect when it's crashed, hung, or compromised.
 
 | Problem | OpenClaw alone | With OuterClaw |
 |---------|---------------|----------------|
@@ -59,6 +78,18 @@ outerclaw cloud setup      # Interactive cloud backup setup
 outerclaw cloud sync       # Sync to encrypted cloud
 outerclaw cloud restore    # Download from cloud
 outerclaw completions      # Shell completions (bash/zsh/fish)
+```
+
+### Three Pillars
+
+```
+  WATCH              VAULT                ALERT
+  ─────              ─────                ─────
+  /proc monitor      Atomic SQLite        Independent Telegram
+  HTTP health        File snapshots       Works when gateway is dead
+  6-state machine    30-min interval      Two-way bot commands
+  Auto-recovery      LKG promotion        Local audit log
+  Identity watcher   Cloud backup (opt)   INFO/WARNING/CRITICAL
 ```
 
 ### User Isolation
@@ -130,8 +161,6 @@ sudo outerclaw status
 
 ## How It Works
 
-A single Rust binary (~3.4 MB) with three pillars:
-
 **WATCH** -- Daemon that monitors the gateway via `/proc` and HTTP. 6-state machine classifies process health. On confirmed hang or failure: restarts gateway. If still down after 90s: rolls back to last known good state. Cross-platform file watching for identity tampering.
 
 **VAULT** -- Atomic backups in `/var/lib/outerclaw/` (inaccessible to the agent). SQLite via `VACUUM INTO`, files with SHA-256 manifests. Disk quota with emergency pruning. I/O pressure gating. Optional encrypted cloud sync.
@@ -180,6 +209,10 @@ sudo outerclaw uninstall
 - OpenClaw installed and configured
 - `sudo` access for installation
 - rclone (optional, for cloud backup)
+
+## Contributing
+
+Contributions welcome! Check out our [issues](https://github.com/Beastlyprime/OuterClaw/issues) -- look for the `good first issue` label.
 
 ## License
 
