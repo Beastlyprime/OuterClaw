@@ -102,6 +102,32 @@ fn run_inner(cfg: &Config, platform: &dyn Platform) -> Result<(), String> {
         &format!("Emergency snapshot saved: {}", emergency_dir.display()),
     );
 
+    // ── Step 4b: Unlock identity files before restoring ─────────
+    // Identity lock (chattr +i) would block file overwrites even as root.
+    let workspace = cfg.openclaw_dir.join("workspace");
+    for name in &["SOUL.md", "AGENTS.md", "USER.md"] {
+        let path = workspace.join(name);
+        if path.exists() {
+            if let Err(e) = platform.set_immutable(&path, false) {
+                log::warn!("Could not clear immutable on {name}: {e}");
+            }
+        }
+    }
+
+    // ── Step 4c: Verify filesystem is writable ──────────────────
+    let probe_path = cfg.openclaw_dir.join("memory/.auto-recover-probe");
+    match fs::write(&probe_path, b"probe") {
+        Ok(()) => {
+            let _ = fs::remove_file(&probe_path);
+        }
+        Err(e) => {
+            return Err(format!(
+                "Target filesystem is not writable ({}): {e}. Check for read-only remount.",
+                cfg.openclaw_dir.display()
+            ));
+        }
+    }
+
     // ── Step 5: Restore SQLite ────────────────────────────────────
     let dst_sqlite = cfg.openclaw_dir.join("memory/main.sqlite");
     if lkg_sqlite.exists() {
@@ -137,6 +163,16 @@ fn run_inner(cfg: &Config, platform: &dyn Platform) -> Result<(), String> {
             .map_err(|e| format!("Failed to restore memory/: {e}"))?;
         fix_ownership_recursive(&dst_memory_dir, &cfg.agent_user)?;
         log_alert(&audit_dir, "memory/ restored from LKG");
+    }
+
+    // ── Step 7b: Re-lock identity files ───────────────────────────
+    for name in &["SOUL.md", "AGENTS.md", "USER.md"] {
+        let path = workspace.join(name);
+        if path.exists() {
+            if let Err(e) = platform.set_immutable(&path, true) {
+                log::warn!("Could not re-lock {name}: {e}");
+            }
+        }
     }
 
     // ── Step 8: Restart gateway ───────────────────────────────────

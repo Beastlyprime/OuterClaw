@@ -30,10 +30,39 @@ pub fn detect_openclaw_binary(agent_user: &str) -> Option<PathBuf> {
         }
     }
 
-    // Method 2: Search common npm global paths
+    // Method 2: Check well-known direct paths under agent home
     let agent_home = format!("/home/{agent_user}");
+    let direct_paths = [
+        format!("{agent_home}/.npm-global/bin/openclaw"),
+        format!("{agent_home}/.nvm/versions/node/*/bin/openclaw"),
+    ];
+    for pattern in &direct_paths {
+        // Use glob-style expansion for paths with wildcards
+        if pattern.contains('*') {
+            if let Ok(output) = Command::new("sh")
+                .args(["-c", &format!("ls -1 {pattern} 2>/dev/null | tail -1")])
+                .output()
+            {
+                let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                if !path.is_empty() {
+                    let p = PathBuf::from(&path);
+                    if p.exists() {
+                        log::debug!("Found openclaw via glob: {}", p.display());
+                        return Some(p);
+                    }
+                }
+            }
+        } else {
+            let p = PathBuf::from(pattern);
+            if p.exists() {
+                log::debug!("Found openclaw at direct path: {}", p.display());
+                return Some(p);
+            }
+        }
+    }
+
+    // Method 2b: Search common lib paths with find (follows symlinks)
     let search_dirs = [
-        format!("{agent_home}/.npm-global"),
         "/usr/local/lib".to_string(),
         "/usr/lib".to_string(),
     ];
@@ -43,22 +72,19 @@ pub fn detect_openclaw_binary(agent_user: &str) -> Option<PathBuf> {
         if !dir.exists() {
             continue;
         }
-        // Use find to locate the binary
         if let Ok(output) = Command::new("find")
             .args([
+                "-L", // follow symlinks
                 dir.to_string_lossy().as_ref(),
                 "-name",
                 "openclaw",
                 "-path",
                 "*/bin/openclaw",
-                "-type",
-                "f",
             ])
             .output()
         {
             if output.status.success() {
                 let stdout = String::from_utf8_lossy(&output.stdout);
-                // Take the last match (likely highest version if multiple)
                 if let Some(last) = stdout.lines().last() {
                     let p = PathBuf::from(last.trim());
                     if p.exists() {
