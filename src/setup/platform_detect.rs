@@ -62,10 +62,7 @@ pub fn detect_openclaw_binary(agent_user: &str) -> Option<PathBuf> {
     }
 
     // Method 2b: Search common lib paths with find (follows symlinks)
-    let search_dirs = [
-        "/usr/local/lib".to_string(),
-        "/usr/lib".to_string(),
-    ];
+    let search_dirs = ["/usr/local/lib".to_string(), "/usr/lib".to_string()];
 
     for search_dir in &search_dirs {
         let dir = PathBuf::from(search_dir);
