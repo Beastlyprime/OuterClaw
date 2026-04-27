@@ -47,12 +47,17 @@ fn run_inner(args: &RollbackArgs, cfg: &Config, platform: &dyn Platform) -> Resu
     println!();
     println!("Will restore:");
 
-    let lkg_sqlite = lkg.join("main.sqlite");
-    if lkg_sqlite.exists() {
-        let size = fs::metadata(&lkg_sqlite)
-            .map(|m| format_size(m.len()))
-            .unwrap_or_else(|_| "?".into());
-        println!("  - SQLite sessions:  {size}");
+    // Every SQLite source the LKG might contain.
+    let mut lkg_dbs: Vec<(&'static str, PathBuf)> = Vec::new();
+    for source in super::snapshot_sqlite::SQLITE_SOURCES {
+        let p = lkg.join(format!("{}.sqlite", source.label));
+        if p.exists() {
+            let size = fs::metadata(&p)
+                .map(|m| format_size(m.len()))
+                .unwrap_or_else(|_| "?".into());
+            println!("  - SQLite[{}]:    {size}", source.label);
+            lkg_dbs.push((source.label, p));
+        }
     }
 
     let lkg_memory_md = lkg.join("MEMORY.md");
@@ -78,7 +83,11 @@ fn run_inner(args: &RollbackArgs, cfg: &Config, platform: &dyn Platform) -> Resu
 
     println!();
     println!("Will OVERWRITE:");
-    println!("  -> {}/memory/main.sqlite", cfg.openclaw_dir.display());
+    for source in super::snapshot_sqlite::SQLITE_SOURCES {
+        if lkg_dbs.iter().any(|(l, _)| *l == source.label) {
+            println!("  -> {}/{}", cfg.openclaw_dir.display(), source.rel_path);
+        }
+    }
     println!("  -> {}/workspace/MEMORY.md", cfg.openclaw_dir.display());
     println!("  -> {}/workspace/memory/", cfg.openclaw_dir.display());
     println!();
@@ -113,12 +122,14 @@ fn run_inner(args: &RollbackArgs, cfg: &Config, platform: &dyn Platform) -> Resu
         .join(format!("{ts}-pre-rollback"));
     fs::create_dir_all(&emergency_dir).map_err(|e| format!("Cannot create emergency dir: {e}"))?;
 
-    let src_sqlite = cfg.openclaw_dir.join("memory/main.sqlite");
     let src_memory_md = cfg.openclaw_dir.join("workspace/MEMORY.md");
     let src_memory_dir = cfg.openclaw_dir.join("workspace/memory");
 
-    if src_sqlite.exists() {
-        let _ = fs::copy(&src_sqlite, emergency_dir.join("main.sqlite"));
+    for source in super::snapshot_sqlite::SQLITE_SOURCES {
+        let src = cfg.openclaw_dir.join(source.rel_path);
+        if src.exists() {
+            let _ = fs::copy(&src, emergency_dir.join(format!("{}.sqlite", source.label)));
+        }
     }
     if src_memory_md.exists() {
         let _ = fs::copy(&src_memory_md, emergency_dir.join("MEMORY.md"));
@@ -130,16 +141,21 @@ fn run_inner(args: &RollbackArgs, cfg: &Config, platform: &dyn Platform) -> Resu
     fix_ownership_outerclaw(&emergency_dir);
     println!("Pre-rollback snapshot saved: {}", emergency_dir.display());
 
-    // ── Step 6: Restore SQLite ────────────────────────────────────
-    if lkg_sqlite.exists() {
-        let dst = cfg.openclaw_dir.join("memory/main.sqlite");
+    // ── Step 6: Restore every SQLite source present in LKG ────────
+    for (label, lkg_db) in &lkg_dbs {
+        let source = super::snapshot_sqlite::SQLITE_SOURCES
+            .iter()
+            .find(|s| s.label == *label)
+            .ok_or_else(|| format!("Unknown sqlite label in LKG: {label}"))?;
+        let dst = cfg.openclaw_dir.join(source.rel_path);
         if let Some(parent) = dst.parent() {
             let _ = fs::create_dir_all(parent);
+            let _ = fix_ownership_user(parent, &cfg.agent_user);
         }
-        fs::copy(&lkg_sqlite, &dst).map_err(|e| format!("Failed to restore SQLite: {e}"))?;
+        fs::copy(lkg_db, &dst).map_err(|e| format!("Failed to restore {label}: {e}"))?;
         fix_ownership_user(&dst, &cfg.agent_user)?;
         set_permissions(&dst, 0o600);
-        println!("  - SQLite restored");
+        println!("  - {label} restored");
     }
 
     // ── Step 6b: Restore MEMORY.md ────────────────────────────────

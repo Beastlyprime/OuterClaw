@@ -42,27 +42,44 @@ fn run_inner(cfg: &Config, platform: &dyn Platform) -> Result<(), String> {
         return Err(format!("LKG path is not a directory: {}", lkg.display()));
     }
 
-    let lkg_sqlite = lkg.join("main.sqlite");
-    if !lkg_sqlite.exists() {
-        return Err(format!("No SQLite in LKG: {}", lkg_sqlite.display()));
-    }
-
-    // ── Step 2: Validate LKG SQLite integrity ─────────────────────
-    {
-        let conn = rusqlite::Connection::open(&lkg_sqlite)
-            .map_err(|e| format!("Cannot open LKG SQLite: {e}"))?;
-        let integrity: String = conn
-            .query_row("PRAGMA integrity_check;", [], |row| row.get(0))
-            .map_err(|e| format!("LKG integrity check query failed: {e}"))?;
-        if integrity != "ok" {
-            return Err(format!("LKG SQLite integrity check failed: {integrity}"));
+    // ── Step 2: Validate LKG — every present SQLite source must pass ─
+    // `main` is required; other sources are validated only if present
+    // (older LKGs created before multi-source support only contain main).
+    let mut lkg_dbs: Vec<(&'static str, PathBuf)> = Vec::new();
+    for source in super::snapshot_sqlite::SQLITE_SOURCES {
+        let p = lkg.join(format!("{}.sqlite", source.label));
+        if p.exists() {
+            let conn = rusqlite::Connection::open(&p)
+                .map_err(|e| format!("Cannot open LKG {}: {e}", source.label))?;
+            let integrity: String = conn
+                .query_row("PRAGMA integrity_check;", [], |row| row.get(0))
+                .map_err(|e| {
+                    format!("LKG integrity check query failed for {}: {e}", source.label)
+                })?;
+            if integrity != "ok" {
+                return Err(format!(
+                    "LKG {} integrity check failed: {integrity}",
+                    source.label
+                ));
+            }
+            lkg_dbs.push((source.label, p));
+        } else if source.label == "main" {
+            return Err(format!("No main SQLite in LKG: {}", p.display()));
         }
     }
 
-    let lkg_rows = super::snapshot_sqlite::count_chunks(&lkg_sqlite);
+    let main_rows = lkg_dbs
+        .iter()
+        .find(|(l, _)| *l == "main")
+        .map(|(_, p)| super::snapshot_sqlite::count_chunks(p))
+        .unwrap_or(0);
     log_alert(
         &audit_dir,
-        &format!("LKG validated: {} (rows={lkg_rows})", lkg.display()),
+        &format!(
+            "LKG validated: {} (sources={}, main_rows={main_rows})",
+            lkg.display(),
+            lkg_dbs.len()
+        ),
     );
 
     // ── Step 3: Stop gateway ──────────────────────────────────────
@@ -80,13 +97,15 @@ fn run_inner(cfg: &Config, platform: &dyn Platform) -> Result<(), String> {
         .join(format!("{ts}-pre-auto-recover"));
     fs::create_dir_all(&emergency_dir).map_err(|e| format!("Cannot create emergency dir: {e}"))?;
 
-    let src_sqlite = cfg.openclaw_dir.join("memory/main.sqlite");
     let src_memory_md = cfg.openclaw_dir.join("workspace/MEMORY.md");
     let src_memory_dir = cfg.openclaw_dir.join("workspace/memory");
 
-    // Best-effort copy of current state
-    if src_sqlite.exists() {
-        let _ = fs::copy(&src_sqlite, emergency_dir.join("main.sqlite"));
+    // Best-effort copy of current state — every SQLite source we know about.
+    for source in super::snapshot_sqlite::SQLITE_SOURCES {
+        let src = cfg.openclaw_dir.join(source.rel_path);
+        if src.exists() {
+            let _ = fs::copy(&src, emergency_dir.join(format!("{}.sqlite", source.label)));
+        }
     }
     if src_memory_md.exists() {
         let _ = fs::copy(&src_memory_md, emergency_dir.join("MEMORY.md"));
@@ -128,17 +147,22 @@ fn run_inner(cfg: &Config, platform: &dyn Platform) -> Result<(), String> {
         }
     }
 
-    // ── Step 5: Restore SQLite ────────────────────────────────────
-    let dst_sqlite = cfg.openclaw_dir.join("memory/main.sqlite");
-    if lkg_sqlite.exists() {
-        // Ensure parent directory exists
-        if let Some(parent) = dst_sqlite.parent() {
+    // ── Step 5: Restore every SQLite source present in LKG ────────
+    for (label, lkg_db) in &lkg_dbs {
+        let source = super::snapshot_sqlite::SQLITE_SOURCES
+            .iter()
+            .find(|s| s.label == *label)
+            .ok_or_else(|| format!("Unknown sqlite label in LKG: {label}"))?;
+        let dst = cfg.openclaw_dir.join(source.rel_path);
+        if let Some(parent) = dst.parent() {
             let _ = fs::create_dir_all(parent);
+            // Inherit ownership for any newly-created parent (e.g. tasks/)
+            let _ = fix_ownership_user(parent, &cfg.agent_user);
         }
-        fs::copy(&lkg_sqlite, &dst_sqlite).map_err(|e| format!("Failed to restore SQLite: {e}"))?;
-        fix_ownership_user(&dst_sqlite, &cfg.agent_user)?;
-        set_permissions(&dst_sqlite, 0o600);
-        log_alert(&audit_dir, "SQLite restored from LKG");
+        fs::copy(lkg_db, &dst).map_err(|e| format!("Failed to restore {label}: {e}"))?;
+        fix_ownership_user(&dst, &cfg.agent_user)?;
+        set_permissions(&dst, 0o600);
+        log_alert(&audit_dir, &format!("{label} restored from LKG"));
     }
 
     // ── Step 6: Restore MEMORY.md ─────────────────────────────────

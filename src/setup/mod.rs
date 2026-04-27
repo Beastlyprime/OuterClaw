@@ -694,44 +694,37 @@ fn check_service_active(service: &str) -> bool {
 
 /// Set filesystem ACLs for the outerclaw user to read OpenClaw data.
 ///
-/// Uses `setfacl` via `std::process::Command`.
+/// Uses `setfacl` via `std::process::Command`. The mask is set explicitly
+/// alongside each user-ACL entry — POSIX ACL masks otherwise get recomputed
+/// when group bits change (e.g. `chmod g-rwx`), silently collapsing the
+/// effective permission to `---` and locking outerclaw out of the directory.
 fn set_acls(agent_home: &str, openclaw_dir: &str) -> Result<(), String> {
-    // Home directory traverse
-    run_setfacl(&["-m", "u:outerclaw:x", agent_home])?;
+    // Home directory traverse — explicit mask (defends against drift).
+    run_setfacl(&["-m", "u:outerclaw:x,m::x", agent_home])?;
 
     // .openclaw root traverse + read
-    run_setfacl(&["-m", "u:outerclaw:rx", openclaw_dir])?;
+    run_setfacl(&["-m", "u:outerclaw:rx,m::rx", openclaw_dir])?;
 
-    // Workspace: recursive read + execute on directories
-    let workspace = format!("{openclaw_dir}/workspace");
-    if Path::new(&workspace).exists() {
-        run_setfacl(&["-R", "-m", "u:outerclaw:rX", &workspace])?;
-        run_setfacl(&["-R", "-d", "-m", "u:outerclaw:rX", &workspace])?;
+    // Recursively grant rX to outerclaw on data subtrees, and set default
+    // ACLs so files created later inherit the right permissions.
+    let data_subdirs = ["workspace", "memory", "tasks", "logs"];
+    for sub in &data_subdirs {
+        let path = format!("{openclaw_dir}/{sub}");
+        if Path::new(&path).exists() {
+            run_setfacl(&["-R", "-m", "u:outerclaw:rX,m::rX", &path])?;
+            run_setfacl(&["-R", "-d", "-m", "u:outerclaw:rX,m::rX", &path])?;
+        }
     }
 
-    // Memory directory
-    let memory = format!("{openclaw_dir}/memory");
-    if Path::new(&memory).exists() {
-        run_setfacl(&["-R", "-m", "u:outerclaw:rX", &memory])?;
-        run_setfacl(&["-R", "-d", "-m", "u:outerclaw:rX", &memory])?;
-    }
-
-    // Default ACL on openclaw root
-    run_setfacl(&["-d", "-m", "u:outerclaw:r", openclaw_dir])?;
+    // Default ACL on openclaw root (covers files created at the top level).
+    run_setfacl(&["-d", "-m", "u:outerclaw:r,m::r", openclaw_dir])?;
 
     // Config files
     for cfg_name in &["openclaw.json", ".env"] {
         let cfg_path = format!("{openclaw_dir}/{cfg_name}");
         if Path::new(&cfg_path).exists() {
-            run_setfacl(&["-m", "u:outerclaw:r", &cfg_path])?;
+            run_setfacl(&["-m", "u:outerclaw:r,m::r", &cfg_path])?;
         }
-    }
-
-    // Logs directory
-    let logs = format!("{openclaw_dir}/logs");
-    if Path::new(&logs).exists() {
-        run_setfacl(&["-R", "-m", "u:outerclaw:rX", &logs])?;
-        run_setfacl(&["-R", "-d", "-m", "u:outerclaw:rX", &logs])?;
     }
 
     Ok(())

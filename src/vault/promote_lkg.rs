@@ -75,13 +75,7 @@ fn run_inner(cfg: &Config, platform: &dyn Platform) -> Result<(), String> {
     }
     println!("Health check: passed");
 
-    // ── Find latest snapshots ──────────────────────────────────────
-    let latest_sql = super::snapshot_sqlite::find_latest_snapshot(&snap_dir).ok_or_else(|| {
-        let msg = format!("No SQLite snapshots found in {}", snap_dir.display());
-        log_lkg(&audit_dir, &format!("FAIL: {msg}"));
-        msg
-    })?;
-
+    // ── Find latest file snapshot (independent of SQLite) ──────────
     let latest_files =
         super::snapshot_sqlite::find_latest_files_snapshot(&snap_dir).ok_or_else(|| {
             let msg = format!("No file snapshots found in {}", snap_dir.display());
@@ -90,8 +84,32 @@ fn run_inner(cfg: &Config, platform: &dyn Platform) -> Result<(), String> {
         })?;
 
     println!("Promoting to LKG:");
-    println!("  SQLite: {}", latest_sql.display());
     println!("  Files:  {}", latest_files.display());
+
+    // ── Find + validate latest snapshot for each SQLite source ────
+    // `main` is required; others are optional (a recent snapshot must exist
+    // in the snapshots dir, otherwise we skip it for this LKG).
+    let mut sources_to_promote: Vec<(&'static str, PathBuf)> = Vec::new();
+    for source in super::snapshot_sqlite::SQLITE_SOURCES {
+        match super::snapshot_sqlite::find_latest_snapshot_by_label(&snap_dir, source.label) {
+            Some(p) => {
+                println!("  SQLite[{}]: {}", source.label, p.display());
+                sources_to_promote.push((source.label, p));
+            }
+            None => {
+                if source.label == "main" {
+                    let msg = format!(
+                        "No {} snapshot found in {}",
+                        source.label,
+                        snap_dir.display()
+                    );
+                    log_lkg(&audit_dir, &format!("FAIL: {msg}"));
+                    return Err(msg);
+                }
+                log::info!("No {} snapshot present, skipping (optional)", source.label);
+            }
+        }
+    }
 
     // ── Create LKG directory ───────────────────────────────────────
     let ts = timestamp_str();
@@ -99,60 +117,74 @@ fn run_inner(cfg: &Config, platform: &dyn Platform) -> Result<(), String> {
     fs::create_dir_all(&lkg_snap)
         .map_err(|e| format!("Cannot create {}: {e}", lkg_snap.display()))?;
 
-    // ── Copy SQLite ────────────────────────────────────────────────
-    let lkg_sqlite = lkg_snap.join("main.sqlite");
-    fs::copy(&latest_sql, &lkg_sqlite).map_err(|e| {
-        let _ = fs::remove_dir_all(&lkg_snap);
-        format!("Failed to copy SQLite: {e}")
-    })?;
+    let current_link = lkg_dir.join("current");
 
-    // ── Verify SQLite integrity ────────────────────────────────────
-    {
-        let conn = rusqlite::Connection::open(&lkg_sqlite).map_err(|e| {
+    // ── Copy + verify each SQLite source ───────────────────────────
+    for (label, latest_sql) in &sources_to_promote {
+        let lkg_sqlite = lkg_snap.join(format!("{label}.sqlite"));
+        fs::copy(latest_sql, &lkg_sqlite).map_err(|e| {
             let _ = fs::remove_dir_all(&lkg_snap);
-            format!("Cannot open LKG SQLite for integrity check: {e}")
+            format!("Failed to copy {} snapshot: {e}", label)
         })?;
-        let integrity: String = conn
-            .query_row("PRAGMA integrity_check;", [], |row| row.get(0))
-            .map_err(|e| {
-                let _ = fs::remove_dir_all(&lkg_snap);
-                format!("integrity_check query failed: {e}")
-            })?;
-        if integrity != "ok" {
-            let _ = fs::remove_dir_all(&lkg_snap);
-            let msg = format!("SQLite integrity check failed: {integrity}");
-            log_lkg(&audit_dir, &format!("FAIL: {msg}"));
-            send_alert("CRITICAL", &format!("LKG promotion FAILED: {msg}"), cfg);
-            return Err(msg);
-        }
-    }
 
-    // ── Row count regression check ─────────────────────────────────
-    let new_rows = super::snapshot_sqlite::count_chunks(&lkg_sqlite);
-    let current_lkg_db = lkg_dir.join("current").join("main.sqlite");
-    if current_lkg_db.exists() {
-        let old_rows = super::snapshot_sqlite::count_chunks(&current_lkg_db);
-        if old_rows > 0 && new_rows > 0 && new_rows < old_rows {
-            let drop_pct = ((old_rows - new_rows) * 100) / old_rows;
-            if drop_pct > 50 {
+        // Integrity check
+        {
+            let conn = rusqlite::Connection::open(&lkg_sqlite).map_err(|e| {
                 let _ = fs::remove_dir_all(&lkg_snap);
-                let msg = format!("Row count regression {drop_pct}% ({old_rows} -> {new_rows})");
+                format!("Cannot open LKG {label} for integrity check: {e}")
+            })?;
+            let integrity: String = conn
+                .query_row("PRAGMA integrity_check;", [], |row| row.get(0))
+                .map_err(|e| {
+                    let _ = fs::remove_dir_all(&lkg_snap);
+                    format!("integrity_check query failed for {label}: {e}")
+                })?;
+            if integrity != "ok" {
+                let _ = fs::remove_dir_all(&lkg_snap);
+                let msg = format!("{label} integrity check failed: {integrity}");
                 log_lkg(&audit_dir, &format!("FAIL: {msg}"));
-                send_alert(
-                    "CRITICAL",
-                    &format!(
-                        "LKG promotion REFUSED: row count dropped {drop_pct}% ({old_rows} -> {new_rows})"
-                    ),
-                    cfg,
-                );
-                eprintln!(
-                    "ERROR: Row count dropped {drop_pct}% ({old_rows} -> {new_rows}). \
-                     Refusing to promote possibly corrupted state."
-                );
+                send_alert("CRITICAL", &format!("LKG promotion FAILED: {msg}"), cfg);
                 return Err(msg);
             }
         }
-        println!("Row count: {new_rows} (previous LKG: {old_rows})");
+
+        // Row-count regression — only for sources with a count_table (main).
+        let count_table = super::snapshot_sqlite::SQLITE_SOURCES
+            .iter()
+            .find(|s| s.label == *label)
+            .and_then(|s| s.count_table);
+        if let Some(table) = count_table {
+            let new_rows = super::snapshot_sqlite::count_rows(&lkg_sqlite, table);
+            let current_lkg_db = current_link.join(format!("{label}.sqlite"));
+            if current_lkg_db.exists() {
+                let old_rows = super::snapshot_sqlite::count_rows(&current_lkg_db, table);
+                if old_rows > 0 && new_rows > 0 && new_rows < old_rows {
+                    let drop_pct = ((old_rows - new_rows) * 100) / old_rows;
+                    if drop_pct > 50 {
+                        let _ = fs::remove_dir_all(&lkg_snap);
+                        let msg = format!(
+                            "{label} row count regression {drop_pct}% ({old_rows} -> {new_rows})"
+                        );
+                        log_lkg(&audit_dir, &format!("FAIL: {msg}"));
+                        send_alert(
+                            "CRITICAL",
+                            &format!(
+                                "LKG promotion REFUSED: {label} row count dropped {drop_pct}% ({old_rows} -> {new_rows})"
+                            ),
+                            cfg,
+                        );
+                        eprintln!(
+                            "ERROR: {label} row count dropped {drop_pct}% ({old_rows} -> {new_rows}). \
+                             Refusing to promote possibly corrupted state."
+                        );
+                        return Err(msg);
+                    }
+                }
+                println!("  {label} rows: {new_rows} (previous LKG: {old_rows})");
+            } else {
+                println!("  {label} rows: {new_rows}");
+            }
+        }
     }
 
     // ── Copy files from latest files snapshot ──────────────────────
@@ -180,7 +212,6 @@ fn run_inner(cfg: &Config, platform: &dyn Platform) -> Result<(), String> {
     }
 
     // ── Update symlink: lkg/current -> lkg/lkg-{ts} ───────────────
-    let current_link = lkg_dir.join("current");
     // Remove old symlink (or file/dir) if it exists
     if current_link.exists() || current_link.symlink_metadata().is_ok() {
         let _ = fs::remove_file(&current_link);

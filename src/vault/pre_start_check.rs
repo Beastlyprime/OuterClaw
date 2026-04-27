@@ -12,54 +12,100 @@ use std::path::Path;
 /// Run pre-start validation. Returns 0 if all checks pass, 1 on any failure.
 pub fn run(cfg: Config, _platform: Box<dyn Platform>) -> i32 {
     let mut failed = false;
-
-    let sqlite_path = cfg.openclaw_dir.join("memory/main.sqlite");
     let workspace_path = cfg.openclaw_dir.join("workspace");
+    let mut row_info = String::from("rows=?");
 
-    // ── Check 1: SQLite exists and is readable ────────────────────
-    if !sqlite_path.exists() {
-        log_pre_start(&format!(
-            "FAIL: SQLite not found: {}",
-            sqlite_path.display()
-        ));
-        failed = true;
-    } else {
-        // ── Check 2: SQLite structural integrity ──────────────────
+    // ── Check each known SQLite source ────────────────────────────
+    // `main` is required; other sources are optional and skipped silently
+    // when absent (older installs / freshly-bootstrapped state).
+    for source in crate::vault::snapshot_sqlite::SQLITE_SOURCES {
+        let sqlite_path = cfg.openclaw_dir.join(source.rel_path);
+
+        match std::fs::metadata(&sqlite_path) {
+            Ok(_) => {}
+            Err(e) => match e.kind() {
+                std::io::ErrorKind::NotFound => {
+                    if source.label == "main" {
+                        log_pre_start(&format!(
+                            "FAIL: {} not found: {}",
+                            source.label,
+                            sqlite_path.display()
+                        ));
+                        failed = true;
+                    } else {
+                        log_pre_start(&format!(
+                            "OK: {} not present (optional): {}",
+                            source.label,
+                            sqlite_path.display()
+                        ));
+                    }
+                    continue;
+                }
+                std::io::ErrorKind::PermissionDenied => {
+                    log_pre_start(&format!(
+                        "FAIL: {} access denied (likely ACL mask drift; run: sudo outerclaw deploy): {}",
+                        source.label,
+                        sqlite_path.display()
+                    ));
+                    failed = true;
+                    continue;
+                }
+                _ => {
+                    log_pre_start(&format!("FAIL: Cannot stat {}: {e}", sqlite_path.display()));
+                    failed = true;
+                    continue;
+                }
+            },
+        }
+
+        // Integrity check
         match check_sqlite_integrity(&sqlite_path) {
             Ok(integrity) => {
                 if integrity != "ok" {
-                    log_pre_start(&format!("FAIL: SQLite integrity check failed: {integrity}"));
+                    log_pre_start(&format!(
+                        "FAIL: {} integrity check failed: {integrity}",
+                        source.label
+                    ));
                     failed = true;
                 }
             }
             Err(e) => {
                 log_pre_start(&format!(
-                    "FAIL: Cannot open SQLite for integrity check: {e}"
+                    "FAIL: Cannot open {} for integrity check: {e}",
+                    source.label
                 ));
                 failed = true;
             }
         }
 
-        // ── Check 3: SQLite has data ──────────────────────────────
-        match count_chunks(&sqlite_path) {
-            Ok(count) => {
-                if count == 0 {
-                    log_pre_start(
-                        "WARNING: SQLite has 0 rows in chunks table (may be fresh install)",
-                    );
-                    // Warning only — don't fail on 0 rows
-                } else {
-                    log_pre_start(&format!("OK: SQLite has {count} rows in chunks"));
+        // Row-count sanity (only for sources with a count_table)
+        if let Some(table) = source.count_table {
+            match count_table_rows(&sqlite_path, table) {
+                Ok(count) => {
+                    if count == 0 {
+                        log_pre_start(&format!(
+                            "WARNING: {} has 0 rows in {table} (may be fresh install)",
+                            source.label
+                        ));
+                    } else {
+                        log_pre_start(&format!("OK: {} has {count} rows in {table}", source.label));
+                    }
+                    if source.label == "main" {
+                        row_info = format!("rows={count}");
+                    }
                 }
-            }
-            Err(e) => {
-                log_pre_start(&format!("FAIL: Cannot query chunks table: {e}"));
-                failed = true;
+                Err(e) => {
+                    log_pre_start(&format!(
+                        "FAIL: Cannot query {table} on {}: {e}",
+                        source.label
+                    ));
+                    failed = true;
+                }
             }
         }
     }
 
-    // ── Check 4: Workspace directory exists ───────────────────────
+    // ── Workspace directory exists ────────────────────────────────
     if !workspace_path.is_dir() {
         log_pre_start(&format!(
             "FAIL: Workspace directory missing: {}",
@@ -78,9 +124,6 @@ pub fn run(cfg: Config, _platform: Box<dyn Platform>) -> i32 {
         );
         1
     } else {
-        let row_info = count_chunks(&sqlite_path)
-            .map(|n| format!("rows={n}"))
-            .unwrap_or_else(|_| "rows=?".into());
         log_pre_start(&format!("OK: Pre-start validation passed ({row_info})"));
         0
     }
@@ -98,14 +141,19 @@ fn check_sqlite_integrity(path: &Path) -> Result<String, String> {
     Ok(result)
 }
 
-/// Count rows in the `chunks` table.
-fn count_chunks(path: &Path) -> Result<i64, String> {
+/// Count rows in `table` of a SQLite database. Returns Err on any failure.
+fn count_table_rows(path: &Path, table: &str) -> Result<i64, String> {
+    if !table.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        return Err(format!("invalid table name: {table}"));
+    }
     let conn = rusqlite::Connection::open(path)
         .map_err(|e| format!("Cannot open {}: {e}", path.display()))?;
 
     let count: i64 = conn
-        .query_row("SELECT COUNT(*) FROM chunks;", [], |row| row.get(0))
-        .map_err(|e| format!("SELECT COUNT(*) FROM chunks failed: {e}"))?;
+        .query_row(&format!("SELECT COUNT(*) FROM {table};"), [], |row| {
+            row.get(0)
+        })
+        .map_err(|e| format!("SELECT COUNT(*) FROM {table} failed: {e}"))?;
 
     Ok(count)
 }
