@@ -720,7 +720,7 @@ fn set_acls(agent_home: &str, openclaw_dir: &str) -> Result<(), String> {
     run_setfacl(&["-d", "-m", "u:outerclaw:r,m::r", openclaw_dir])?;
 
     // Config files
-    for cfg_name in &["openclaw.json", ".env"] {
+    for cfg_name in &["openclaw.json", "exec-approvals.json", ".env"] {
         let cfg_path = format!("{openclaw_dir}/{cfg_name}");
         if Path::new(&cfg_path).exists() {
             run_setfacl(&["-m", "u:outerclaw:r,m::r", &cfg_path])?;
@@ -744,7 +744,7 @@ fn remove_acls(agent_home: &str, openclaw_dir: &str) {
         }
     }
 
-    for cfg_name in &["openclaw.json", ".env"] {
+    for cfg_name in &["openclaw.json", "exec-approvals.json", ".env"] {
         let cfg_path = format!("{openclaw_dir}/{cfg_name}");
         if Path::new(&cfg_path).exists() {
             let _ = run_setfacl(&["-x", "u:outerclaw", &cfg_path]);

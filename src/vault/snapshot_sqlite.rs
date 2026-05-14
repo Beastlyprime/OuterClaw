@@ -134,9 +134,14 @@ fn snapshot_one(
     let dst_tmp = dst_dir.join(format!("{}-{ts}.sqlite.tmp", source.label));
 
     // ── VACUUM INTO ────────────────────────────────────────────────
+    // Open the source read-only. rusqlite's default OPEN_READWRITE | OPEN_CREATE
+    // would make SQLite try to create a hot journal in the source's directory and
+    // write to the -shm sidecar of a WAL database — neither of which outerclaw
+    // has permission for (and shouldn't, by minimum-privilege design).
     {
         let conn =
-            rusqlite::Connection::open(src).map_err(|e| format!("Cannot open source DB: {e}"))?;
+            rusqlite::Connection::open_with_flags(src, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .map_err(|e| format!("Cannot open source DB: {e}"))?;
         let vacuum_sql = format!("VACUUM INTO '{}'", dst_tmp.display());
         conn.execute_batch(&vacuum_sql).map_err(|e| {
             let _ = fs::remove_file(&dst_tmp);

@@ -173,7 +173,7 @@ Group=outerclaw
 # get recomputed when group bits change (e.g. chmod g-rwx by the agent
 # user or its package manager), which collapses outerclaw's effective
 # read permission to ---. Re-applying with explicit m::rx is idempotent.
-ExecStartPre=+/bin/bash -c 'D=$(grep "^OPENCLAW_DIR=" {ENV_FILE} 2>/dev/null | cut -d= -f2); D="${{D:-/home/ocagent/.openclaw}}"; for P in "$D" "$D/memory" "$D/tasks" "$D/workspace" "$D/logs"; do [ -d "$P" ] && setfacl -m u:outerclaw:rx,m::rx "$P" 2>/dev/null; done; for F in "$D/memory/main.sqlite" "$D/tasks/runs.sqlite"; do [ -f "$F" ] && setfacl -m u:outerclaw:r,m::r "$F" 2>/dev/null; done; true'
+ExecStartPre=+/bin/bash -c 'D=$(grep "^OPENCLAW_DIR=" {ENV_FILE} 2>/dev/null | cut -d= -f2); D="${{D:-/home/ocagent/.openclaw}}"; for P in "$D" "$D/memory" "$D/tasks" "$D/workspace" "$D/logs"; do [ -d "$P" ] && setfacl -m u:outerclaw:rx,m::rx "$P" 2>/dev/null; done; shopt -s nullglob; for F in "$D/memory/main.sqlite"* "$D/tasks/runs.sqlite"* "$D/openclaw.json" "$D/exec-approvals.json"; do [ -f "$F" ] && setfacl -m u:outerclaw:r,m::r "$F" 2>/dev/null; done; true'
 
 ExecStart={BIN} snapshot --sqlite-only
 ExecStart={BIN} snapshot --files-only
