@@ -21,8 +21,6 @@ pub mod runit;
 pub mod systemd;
 pub mod users;
 
-/// Vault base directory.
-const VAULT: &str = "/var/lib/outerclaw";
 /// Systemd unit directory.
 const SYSTEMD_DIR: &str = "/etc/systemd/system";
 
@@ -112,12 +110,12 @@ pub fn install(args: SetupArgs, cfg: Config, platform: Box<dyn Platform>) -> i32
         println!("  User 'ocagent' ready");
     }
 
-    let vault_path = PathBuf::from(VAULT);
-    if let Err(e) = users::ensure_system_user("outerclaw", &vault_path, "/usr/sbin/nologin") {
-        eprintln!("  ERROR creating outerclaw: {e}");
+    let watchdog = cfg.watchdog_user.clone();
+    if let Err(e) = users::ensure_system_user(&watchdog, &cfg.vault_dir, "/usr/sbin/nologin") {
+        eprintln!("  ERROR creating {watchdog}: {e}");
         return 1;
     }
-    println!("  User 'outerclaw' ready");
+    println!("  User '{watchdog}' ready");
 
     // ── Step 2: Deploy (vault, binary, units, config) ────────────
     // Build a temporary config that reflects the chosen agent_user / openclaw_dir
@@ -242,14 +240,16 @@ pub fn deploy(cfg: Config, platform: Box<dyn Platform>) -> i32 {
 
 /// Internal deployment logic shared by `install()` and `deploy()`.
 fn deploy_inner(cfg: &Config, _platform: &dyn Platform) -> i32 {
-    let vault = PathBuf::from(VAULT);
+    let vault = cfg.vault_dir.clone();
+    let vault_str = vault.to_string_lossy().to_string();
+    let watchdog = &cfg.watchdog_user;
     let agent_user = &cfg.agent_user;
     let openclaw_dir = cfg.openclaw_dir.to_string_lossy().to_string();
 
     // ── Phase 1: Create users if missing ─────────────────────────
     println!("  Phase 1: Ensuring users exist");
-    if let Err(e) = users::ensure_system_user("outerclaw", &vault, "/usr/sbin/nologin") {
-        eprintln!("  ERROR creating outerclaw user: {e}");
+    if let Err(e) = users::ensure_system_user(watchdog, &vault, "/usr/sbin/nologin") {
+        eprintln!("  ERROR creating {watchdog} user: {e}");
         return 1;
     }
     // Only create ocagent if that's the configured agent user
@@ -271,22 +271,25 @@ fn deploy_inner(cfg: &Config, _platform: &dyn Platform) -> i32 {
         }
     }
 
-    // Set ownership: vault owned by outerclaw
+    // Set ownership: vault owned by the watchdog user
+    let owner = format!("{watchdog}:{watchdog}");
     let _ = Command::new("chown")
-        .args(["-R", "outerclaw:outerclaw", VAULT])
+        .args(["-R", &owner, &vault_str])
         .status();
-    let _ = Command::new("chmod").args(["-R", "700", VAULT]).status();
+    let _ = Command::new("chmod")
+        .args(["-R", "700", &vault_str])
+        .status();
     // Vault root: 711 allows traverse but not listing
-    let _ = Command::new("chmod").args(["711", VAULT]).status();
+    let _ = Command::new("chmod").args(["711", &vault_str]).status();
     // bin/ must be 755 so gateway service (ocagent) can execute start-gateway.sh
     let bin_dir = vault.join("bin");
     let bin_dir_str = bin_dir.to_string_lossy();
     let _ = Command::new("chmod").args(["755", &*bin_dir_str]).status();
-    println!("  Vault structure at {VAULT}");
+    println!("  Vault structure at {vault_str}");
 
     // ── Phase 3: Copy self binary ────────────────────────────────
     println!("  Phase 3: Deploying binary");
-    let dest_bin = vault.join("bin").join("outerclaw");
+    let dest_bin = cfg.bin_path();
     match std::env::current_exe() {
         Ok(self_path) => {
             if let Err(e) = fs::copy(&self_path, &dest_bin) {
@@ -322,7 +325,7 @@ fn deploy_inner(cfg: &Config, _platform: &dyn Platform) -> i32 {
     // ── Phase 5: Sudoers ─────────────────────────────────────────
     println!("  Phase 5: Sudoers");
     let sudoers_path = "/etc/sudoers.d/outerclaw";
-    let sudoers_content = systemd::sudoers_config();
+    let sudoers_content = systemd::sudoers_config(cfg);
     if let Err(e) = fs::write(sudoers_path, &sudoers_content) {
         eprintln!("  ERROR writing sudoers: {e}");
         return 1;
@@ -349,32 +352,32 @@ fn deploy_inner(cfg: &Config, _platform: &dyn Platform) -> i32 {
     // ── Phase 6: Systemd units ───────────────────────────────────
     println!("  Phase 6: Systemd units");
     let units: Vec<(&str, String)> = vec![
-        ("oc-outerclaw.service", systemd::outerclaw_service()),
-        (
-            "openclaw-gateway.service",
-            systemd::gateway_service(agent_user, &openclaw_dir),
-        ),
+        ("oc-outerclaw.service", systemd::outerclaw_service(cfg)),
+        ("openclaw-gateway.service", systemd::gateway_service(cfg)),
         ("oc-snapshot.timer", systemd::snapshot_timer().to_string()),
-        ("oc-snapshot.service", systemd::snapshot_service()),
+        ("oc-snapshot.service", systemd::snapshot_service(cfg)),
         (
             "oc-healthcheck.timer",
             systemd::healthcheck_timer().to_string(),
         ),
-        ("oc-healthcheck.service", systemd::healthcheck_service()),
+        ("oc-healthcheck.service", systemd::healthcheck_service(cfg)),
         (
             "oc-lkg-promote.timer",
             systemd::lkg_promote_timer().to_string(),
         ),
-        ("oc-lkg-promote.service", systemd::lkg_promote_service()),
+        ("oc-lkg-promote.service", systemd::lkg_promote_service(cfg)),
         (
             "oc-cloud-sync.timer",
             systemd::cloud_sync_timer().to_string(),
         ),
-        ("oc-cloud-sync.service", systemd::cloud_sync_service()),
-        ("oc-identity-lock.service", systemd::identity_lock_service()),
+        ("oc-cloud-sync.service", systemd::cloud_sync_service(cfg)),
+        (
+            "oc-identity-lock.service",
+            systemd::identity_lock_service(cfg),
+        ),
         (
             "oc-identity-unlock.service",
-            systemd::identity_unlock_service(),
+            systemd::identity_unlock_service(cfg),
         ),
     ];
 
@@ -438,7 +441,7 @@ fn deploy_inner(cfg: &Config, _platform: &dyn Platform) -> i32 {
     // ── Phase 8: Logrotate ───────────────────────────────────────
     println!("  Phase 8: Logrotate");
     let logrotate_path = "/etc/logrotate.d/outerclaw";
-    if let Err(e) = fs::write(logrotate_path, systemd::logrotate_config()) {
+    if let Err(e) = fs::write(logrotate_path, systemd::logrotate_config(cfg)) {
         eprintln!("  WARNING: Could not write logrotate config: {e}");
     } else {
         let _ = fs::set_permissions(logrotate_path, fs::Permissions::from_mode(0o644));
@@ -524,7 +527,7 @@ pub fn uninstall(args: UninstallArgs, cfg: Config, platform: Box<dyn Platform>) 
     println!();
     println!("  Agent user:    {agent_user}");
     println!("  OpenClaw dir:  {openclaw_dir}");
-    println!("  Vault:         {VAULT}");
+    println!("  Vault:         {}", cfg.vault_dir.display());
     println!();
 
     // ── Confirmation ─────────────────────────────────────────────
@@ -600,7 +603,7 @@ pub fn uninstall(args: UninstallArgs, cfg: Config, platform: Box<dyn Platform>) 
     // ── Step 6: Optionally remove vault ──────────────────────────
     println!();
     println!("[6/7] Vault removal");
-    let vault_path = PathBuf::from(VAULT);
+    let vault_path = cfg.vault_dir.clone();
     if vault_path.exists() {
         let remove_vault = if args.remove_vault || args.yes {
             true
@@ -619,36 +622,37 @@ pub fn uninstall(args: UninstallArgs, cfg: Config, platform: Box<dyn Platform>) 
                 println!("  Vault removed");
             }
         } else {
-            println!("  Vault preserved at {VAULT}");
+            println!("  Vault preserved at {}", vault_path.display());
         }
     } else {
         println!("  Vault not found (already removed)");
     }
 
-    // ── Step 7: Optionally remove outerclaw user ─────────────────
+    // ── Step 7: Optionally remove watchdog user ──────────────────
     println!();
     println!("[7/7] User removal");
-    if users::user_exists("outerclaw") {
+    let watchdog = cfg.watchdog_user.clone();
+    if users::user_exists(&watchdog) {
         let remove_user = if args.remove_users || args.yes {
             true
         } else {
             let confirm = dialoguer::Confirm::new()
-                .with_prompt("Remove the 'outerclaw' system user?")
+                .with_prompt(format!("Remove the '{watchdog}' system user?"))
                 .default(false)
                 .interact();
             confirm.unwrap_or(false)
         };
 
         if remove_user {
-            match users::remove_user("outerclaw") {
-                Ok(()) => println!("  User 'outerclaw' removed"),
+            match users::remove_user(&watchdog) {
+                Ok(()) => println!("  User '{watchdog}' removed"),
                 Err(e) => eprintln!("  WARNING: {e}"),
             }
         } else {
-            println!("  User 'outerclaw' preserved");
+            println!("  User '{watchdog}' preserved");
         }
     } else {
-        println!("  User 'outerclaw' not found (already removed)");
+        println!("  User '{watchdog}' not found (already removed)");
     }
 
     // ── Done ─────────────────────────────────────────────────────
@@ -656,7 +660,10 @@ pub fn uninstall(args: UninstallArgs, cfg: Config, platform: Box<dyn Platform>) 
     println!("  OuterClaw — Uninstall Complete");
     println!();
     println!("  NOTE: openclaw-gateway.service was NOT removed (belongs to OpenClaw).");
-    println!("  It references {VAULT}/bin/ which may no longer exist.");
+    println!(
+        "  It references {}/bin/ which may no longer exist.",
+        cfg.vault_dir.display()
+    );
     println!();
     println!("  To remove it:");
     println!("    sudo systemctl disable --now openclaw-gateway.service");
