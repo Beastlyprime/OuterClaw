@@ -3,16 +3,18 @@
 //! Rust port of `scripts/cloud-restore.sh`. Supports listing available
 //! backups, showing the recovery hint, and downloading specific LKG states
 //! or snapshots with post-download integrity verification.
+//!
+//! The `pull_latest_lkg` library API is the entry point for the bootstrap
+//! orchestrator (a follow-up PR) — it resolves the newest cloud LKG name
+//! and downloads it without needing CLI flags.
 
 use crate::cli::CloudRestoreArgs;
 use crate::config::Config;
 use crate::platform::Platform;
 use std::fs;
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
-
-const RCLONE_CONFIG_PATH: &str = "/var/lib/outerclaw/config/rclone.conf";
 
 /// Run the cloud restore operation based on CLI flags.
 pub fn run(args: CloudRestoreArgs, cfg: Config, _platform: Box<dyn Platform>) -> i32 {
@@ -34,9 +36,12 @@ pub fn run(args: CloudRestoreArgs, cfg: Config, _platform: Box<dyn Platform>) ->
     }
 
     // ── Preflight: rclone config exists ─────────────────────────
-    let rclone_config = Path::new(RCLONE_CONFIG_PATH);
+    let rclone_config = cfg.rclone_config_path();
     if !rclone_config.exists() {
-        eprintln!("ERROR: rclone config not found -- run 'outerclaw cloud setup' first");
+        eprintln!(
+            "ERROR: rclone config not found at {} -- run 'outerclaw cloud setup' first",
+            rclone_config.display()
+        );
         return 1;
     }
 
@@ -44,24 +49,116 @@ pub fn run(args: CloudRestoreArgs, cfg: Config, _platform: Box<dyn Platform>) ->
 
     // Dispatch based on flags
     if args.show_hint {
-        return show_hint(rclone_config, cloud_remote);
+        return show_hint(&rclone_config, cloud_remote);
     }
 
     if args.list {
-        return list_cloud(rclone_config, cloud_remote);
+        return list_cloud(&rclone_config, cloud_remote);
+    }
+
+    if args.latest_lkg {
+        return match pull_latest_lkg(&cfg) {
+            Ok(path) => {
+                println!();
+                println!("[OK] Latest LKG pulled to {}", path.display());
+                println!("To apply, run: sudo outerclaw rollback");
+                0
+            }
+            Err(e) => {
+                eprintln!("ERROR: {e}");
+                1
+            }
+        };
     }
 
     if let Some(ref name) = args.restore_lkg {
-        return restore_lkg(name, rclone_config, cloud_remote, &cfg.vault_dir);
+        return restore_lkg(name, &rclone_config, cloud_remote, &cfg);
     }
 
     if let Some(ref name) = args.restore_snapshot {
-        return restore_snapshot(name, rclone_config, cloud_remote, &cfg.vault_dir);
+        return restore_snapshot(name, &rclone_config, cloud_remote, &cfg);
     }
 
     // No flags specified: print usage
     print_usage();
     0
+}
+
+/// Resolve the latest LKG name on the remote (lexicographic-sort descending,
+/// since LKGs are timestamped). Returns `Err` if rclone fails or no LKG exists.
+pub fn resolve_latest_lkg_name(rclone_config: &Path, cloud_remote: &str) -> Result<String, String> {
+    let config_str = rclone_config.to_string_lossy();
+    let output = Command::new("rclone")
+        .args([
+            "lsd",
+            &format!("{cloud_remote}:lkg/"),
+            "--config",
+            &config_str,
+        ])
+        .output()
+        .map_err(|e| format!("rclone lsd failed: {e}"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!(
+            "rclone lsd exited {}: {stderr}",
+            output.status.code().unwrap_or(-1)
+        ));
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut names: Vec<String> = stdout
+        .lines()
+        .filter_map(|line| line.split_whitespace().last().map(|s| s.to_string()))
+        .filter(|n| !n.is_empty())
+        .collect();
+    names.sort();
+    names
+        .pop()
+        .ok_or_else(|| "no LKG directories found on cloud remote".to_string())
+}
+
+/// Library API: download the most recent LKG to `cfg.lkg_dir()`. Used by the
+/// bootstrap orchestrator. Returns the local destination directory on success.
+pub fn pull_latest_lkg(cfg: &Config) -> Result<PathBuf, String> {
+    let rclone_config = cfg.rclone_config_path();
+    if !rclone_config.exists() {
+        return Err(format!(
+            "rclone config not found at {} — run 'outerclaw cloud setup' first",
+            rclone_config.display()
+        ));
+    }
+
+    let name = resolve_latest_lkg_name(&rclone_config, &cfg.cloud_remote)?;
+    println!("Latest LKG on cloud: {name}");
+
+    let dest = cfg.lkg_dir().join(&name);
+    fs::create_dir_all(&dest).map_err(|e| format!("cannot create {}: {e}", dest.display()))?;
+
+    let config_str = rclone_config.to_string_lossy();
+    let status = Command::new("rclone")
+        .args([
+            "copy",
+            &format!("{}:lkg/{}/", cfg.cloud_remote, name),
+            &dest.to_string_lossy(),
+            "--config",
+            &config_str,
+            "--progress",
+        ])
+        .status()
+        .map_err(|e| format!("rclone copy failed: {e}"))?;
+
+    if !status.success() {
+        return Err(format!(
+            "rclone copy exited {}",
+            status.code().unwrap_or(-1)
+        ));
+    }
+
+    set_watchdog_ownership(&dest, &cfg.watchdog_user);
+    log_restore(&cfg.vault_dir, &format!("RESTORED (latest): LKG '{name}'"));
+    check_sqlite_files_in_dir(&dest);
+    Ok(dest)
 }
 
 /// List available cloud backups (LKG states and snapshots).
@@ -188,9 +285,9 @@ fn show_hint(rclone_config: &Path, cloud_remote: &str) -> i32 {
 }
 
 /// Restore an LKG state from cloud.
-fn restore_lkg(name: &str, rclone_config: &Path, cloud_remote: &str, vault_dir: &Path) -> i32 {
+fn restore_lkg(name: &str, rclone_config: &Path, cloud_remote: &str, cfg: &Config) -> i32 {
     let config_str = rclone_config.to_string_lossy();
-    let dest = vault_dir.join("lkg").join(name);
+    let dest = cfg.lkg_dir().join(name);
 
     println!();
     println!("Downloading LKG '{name}' from cloud...");
@@ -217,9 +314,12 @@ fn restore_lkg(name: &str, rclone_config: &Path, cloud_remote: &str, vault_dir: 
     match status {
         Ok(s) if s.success() => {
             // Fix ownership
-            set_outerclaw_ownership(&dest);
+            set_watchdog_ownership(&dest, &cfg.watchdog_user);
 
-            log_restore(vault_dir, &format!("RESTORED: LKG '{name}' from cloud"));
+            log_restore(
+                &cfg.vault_dir,
+                &format!("RESTORED: LKG '{name}' from cloud"),
+            );
 
             println!();
             println!("[OK] LKG restored to {}", dest.display());
@@ -234,7 +334,7 @@ fn restore_lkg(name: &str, rclone_config: &Path, cloud_remote: &str, vault_dir: 
         _ => {
             eprintln!("ERROR: Failed to download LKG -- check logs and credentials");
             log_restore(
-                vault_dir,
+                &cfg.vault_dir,
                 &format!("ERROR: Failed to restore LKG '{name}' from cloud"),
             );
             return 1;
@@ -245,9 +345,9 @@ fn restore_lkg(name: &str, rclone_config: &Path, cloud_remote: &str, vault_dir: 
 }
 
 /// Restore a snapshot file from cloud.
-fn restore_snapshot(name: &str, rclone_config: &Path, cloud_remote: &str, vault_dir: &Path) -> i32 {
+fn restore_snapshot(name: &str, rclone_config: &Path, cloud_remote: &str, cfg: &Config) -> i32 {
     let config_str = rclone_config.to_string_lossy();
-    let dest = vault_dir.join("snapshots").join(name);
+    let dest = cfg.snapshots_dir().join(name);
 
     // Ensure snapshots directory exists
     if let Some(parent) = dest.parent() {
@@ -277,10 +377,10 @@ fn restore_snapshot(name: &str, rclone_config: &Path, cloud_remote: &str, vault_
     match status {
         Ok(s) if s.success() => {
             // Fix ownership and permissions
-            set_outerclaw_ownership_file(&dest);
+            set_watchdog_ownership_file(&dest, &cfg.watchdog_user);
 
             log_restore(
-                vault_dir,
+                &cfg.vault_dir,
                 &format!("RESTORED: snapshot '{name}' from cloud"),
             );
 
@@ -295,7 +395,7 @@ fn restore_snapshot(name: &str, rclone_config: &Path, cloud_remote: &str, vault_
         _ => {
             eprintln!("ERROR: Failed to download snapshot -- check logs and credentials");
             log_restore(
-                vault_dir,
+                &cfg.vault_dir,
                 &format!("ERROR: Failed to restore snapshot '{name}' from cloud"),
             );
             return 1;
@@ -384,20 +484,22 @@ fn check_sqlite_files_in_dir(dir: &Path) {
     }
 }
 
-/// Set ownership to outerclaw:outerclaw on a directory (recursively via chown -R).
-fn set_outerclaw_ownership(path: &Path) {
+/// Set ownership to the watchdog user on a directory (recursively).
+fn set_watchdog_ownership(path: &Path, watchdog_user: &str) {
+    let owner = format!("{watchdog_user}:{watchdog_user}");
     let _ = Command::new("chown")
-        .args(["-R", "outerclaw:outerclaw", &path.to_string_lossy()])
+        .args(["-R", &owner, &path.to_string_lossy()])
         .status();
     let _ = Command::new("chmod")
         .args(["-R", "700", &path.to_string_lossy()])
         .status();
 }
 
-/// Set ownership to outerclaw:outerclaw on a single file.
-fn set_outerclaw_ownership_file(path: &Path) {
+/// Set ownership to the watchdog user on a single file.
+fn set_watchdog_ownership_file(path: &Path, watchdog_user: &str) {
+    let owner = format!("{watchdog_user}:{watchdog_user}");
     let _ = Command::new("chown")
-        .args(["outerclaw:outerclaw", &path.to_string_lossy()])
+        .args([&owner, &path.to_string_lossy().to_string()])
         .status();
     let _ = Command::new("chmod")
         .args(["600", &path.to_string_lossy()])
@@ -447,11 +549,13 @@ fn print_usage() {
     println!("Options:");
     println!("  --list                         List all cloud backups");
     println!("  --show-hint                    Show password recovery hint from cloud");
-    println!("  --restore-lkg <name>           Download an LKG state from cloud");
+    println!("  --latest-lkg                   Pull the most recent LKG (no name needed)");
+    println!("  --restore-lkg <name>           Download a specific LKG by name");
     println!("  --restore-snapshot <name>      Download a snapshot file from cloud");
     println!();
     println!("Examples:");
     println!("  sudo outerclaw cloud restore --list");
+    println!("  sudo outerclaw cloud restore --latest-lkg");
     println!("  sudo outerclaw cloud restore --restore-lkg lkg-2026-03-20T10:00:00");
     println!("  sudo outerclaw cloud restore --restore-snapshot main-2026-03-20T12:00:00.sqlite");
     println!();
