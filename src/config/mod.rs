@@ -1,5 +1,36 @@
 use std::path::{Path, PathBuf};
 
+/// Privilege and isolation mode the OuterClaw deployment runs in.
+///
+/// * `Sudo` — production default. Three-user isolation (agent / watchdog / admin),
+///   system-level systemd units, ACL-based cross-user read access. Required for
+///   any deployment exposed to untrusted input (e.g. public Discord bots).
+/// * `User` — single-UID mode for personal machines where no privilege boundary
+///   is needed between the agent and the watchdog. Uses `systemd --user` units
+///   and per-user data directories; no ACLs, no sudo. Disables the isolation
+///   guarantee in exchange for not needing root.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mode {
+    Sudo,
+    User,
+}
+
+impl Mode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Mode::Sudo => "sudo",
+            Mode::User => "user",
+        }
+    }
+
+    fn from_env(value: &str) -> Self {
+        match value.to_ascii_lowercase().as_str() {
+            "user" | "user-mode" | "usermode" => Mode::User,
+            _ => Mode::Sudo,
+        }
+    }
+}
+
 /// OuterClaw configuration — loaded from env file + environment variables.
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -26,10 +57,13 @@ pub struct Config {
     // Identity
     pub identity_unlock_timeout: u64,
 
-    // Paths
+    // Mode & paths
+    pub mode: Mode,
     pub openclaw_dir: PathBuf,
     pub vault_dir: PathBuf,
     pub agent_user: String,
+    pub agent_home: PathBuf,
+    pub watchdog_user: String,
 
     // Telegram
     pub tg_token: String,
@@ -51,9 +85,13 @@ pub struct Config {
 
 impl Config {
     /// Load configuration from env file and environment variables.
-    /// Priority: environment variables > env file > defaults
+    /// Priority: environment variables > env file > mode-derived defaults
     pub fn load() -> Result<Self, String> {
-        let env_file = PathBuf::from("/var/lib/outerclaw/config/outerclaw.env");
+        // Mode is read first because it determines path defaults. Source order:
+        // env var only (the env file itself lives at a mode-dependent path).
+        let mode = Mode::from_env(&std::env::var("OUTERCLAW_MODE").unwrap_or_default());
+
+        let env_file = default_env_file_path(mode);
         let env_map = if env_file.exists() {
             parse_env_file(&env_file)?
         } else {
@@ -78,7 +116,41 @@ impl Config {
             return Err("GATEWAY_PORT must be > 0".into());
         }
 
-        let openclaw_dir = PathBuf::from(get("OPENCLAW_DIR", "/home/ocagent/.openclaw"));
+        // Mode-derived identity & paths. User-mode collapses agent and watchdog
+        // onto the current $USER and roots everything under $HOME; sudo-mode
+        // keeps the canonical three-user layout under /home/ocagent and /var/lib.
+        let (current_user, home_dir) = match mode {
+            Mode::User => (
+                std::env::var("USER").unwrap_or_else(|_| "outerclaw".into()),
+                std::env::var("HOME").unwrap_or_else(|_| "/tmp".into()),
+            ),
+            Mode::Sudo => (String::new(), String::new()),
+        };
+
+        let agent_user = match mode {
+            Mode::Sudo => get("AGENT_USER", "ocagent"),
+            Mode::User => get("AGENT_USER", &current_user),
+        };
+
+        let agent_home_default = match mode {
+            Mode::Sudo => format!("/home/{agent_user}"),
+            Mode::User => home_dir.clone(),
+        };
+        let agent_home = PathBuf::from(get("AGENT_HOME", &agent_home_default));
+
+        let openclaw_default = format!("{}/.openclaw", agent_home.display());
+        let openclaw_dir = PathBuf::from(get("OPENCLAW_DIR", &openclaw_default));
+
+        let vault_default = match mode {
+            Mode::Sudo => "/var/lib/outerclaw".to_string(),
+            Mode::User => format!("{home_dir}/.local/share/outerclaw"),
+        };
+        let vault_dir = PathBuf::from(get("VAULT_DIR", &vault_default));
+
+        let watchdog_user = match mode {
+            Mode::Sudo => get("WATCHDOG_USER", "outerclaw"),
+            Mode::User => get("WATCHDOG_USER", &current_user),
+        };
 
         // Telegram: try dedicated token first, fall back to openclaw.json
         let mut tg_token = get("OUTERCLAW_TG_TOKEN", "");
@@ -122,9 +194,12 @@ impl Config {
 
             identity_unlock_timeout: 600,
 
+            mode,
             openclaw_dir,
-            vault_dir: PathBuf::from("/var/lib/outerclaw"),
-            agent_user: get("AGENT_USER", "ocagent"),
+            vault_dir,
+            agent_user,
+            agent_home,
+            watchdog_user,
 
             tg_token,
             tg_chat,
@@ -141,6 +216,44 @@ impl Config {
         })
     }
 
+    // ── Vault-derived path helpers ─────────────────────────────────
+    //
+    // Always derive from `vault_dir` so a non-default vault (set via env or
+    // VAULT_DIR override) propagates everywhere. Call sites that previously
+    // hardcoded `/var/lib/outerclaw/...` should switch to these.
+
+    pub fn bin_dir(&self) -> PathBuf {
+        self.vault_dir.join("bin")
+    }
+
+    pub fn bin_path(&self) -> PathBuf {
+        self.bin_dir().join("outerclaw")
+    }
+
+    pub fn config_dir(&self) -> PathBuf {
+        self.vault_dir.join("config")
+    }
+
+    pub fn env_file_path(&self) -> PathBuf {
+        self.config_dir().join("outerclaw.env")
+    }
+
+    pub fn rclone_config_path(&self) -> PathBuf {
+        self.config_dir().join("rclone.conf")
+    }
+
+    pub fn audit_dir(&self) -> PathBuf {
+        self.vault_dir.join("audit")
+    }
+
+    pub fn snapshots_dir(&self) -> PathBuf {
+        self.vault_dir.join("snapshots")
+    }
+
+    pub fn lkg_dir(&self) -> PathBuf {
+        self.vault_dir.join("lkg")
+    }
+
     /// Watched identity/config file paths
     pub fn watched_files(&self) -> Vec<PathBuf> {
         let ws = self.openclaw_dir.join("workspace");
@@ -150,6 +263,21 @@ impl Config {
             ws.join("USER.md"),
             self.openclaw_dir.join("openclaw.json"),
         ]
+    }
+}
+
+/// Default env file location for a given mode. The env var `OUTERCLAW_ENV_FILE`
+/// can override this if a user has installed in a non-standard location.
+fn default_env_file_path(mode: Mode) -> PathBuf {
+    if let Ok(p) = std::env::var("OUTERCLAW_ENV_FILE") {
+        return PathBuf::from(p);
+    }
+    match mode {
+        Mode::Sudo => PathBuf::from("/var/lib/outerclaw/config/outerclaw.env"),
+        Mode::User => {
+            let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+            PathBuf::from(format!("{home}/.config/outerclaw/outerclaw.env"))
+        }
     }
 }
 
@@ -221,6 +349,97 @@ mod tests {
         assert!(!is_valid_tg_token(":noid"));
         assert!(!is_valid_tg_token("123:bad space"));
         assert!(!is_valid_tg_token("123:bad;injection"));
+    }
+
+    #[test]
+    fn test_mode_from_env() {
+        assert_eq!(Mode::from_env(""), Mode::Sudo);
+        assert_eq!(Mode::from_env("sudo"), Mode::Sudo);
+        assert_eq!(Mode::from_env("anything-else"), Mode::Sudo);
+        assert_eq!(Mode::from_env("user"), Mode::User);
+        assert_eq!(Mode::from_env("USER"), Mode::User);
+        assert_eq!(Mode::from_env("user-mode"), Mode::User);
+        assert_eq!(Mode::from_env("usermode"), Mode::User);
+    }
+
+    #[test]
+    fn test_mode_as_str() {
+        assert_eq!(Mode::Sudo.as_str(), "sudo");
+        assert_eq!(Mode::User.as_str(), "user");
+    }
+
+    #[test]
+    fn test_default_env_file_path_sudo() {
+        // Clear override so we exercise the mode-based default
+        let prev = std::env::var("OUTERCLAW_ENV_FILE").ok();
+        unsafe {
+            std::env::remove_var("OUTERCLAW_ENV_FILE");
+        }
+        assert_eq!(
+            default_env_file_path(Mode::Sudo),
+            PathBuf::from("/var/lib/outerclaw/config/outerclaw.env")
+        );
+        // Restore prior state
+        if let Some(v) = prev {
+            unsafe {
+                std::env::set_var("OUTERCLAW_ENV_FILE", v);
+            }
+        }
+    }
+
+    #[test]
+    fn test_vault_helper_methods() {
+        let cfg = Config {
+            gateway_port: 18789,
+            gateway_service: "openclaw-gateway.service".into(),
+            health_timeout: 5,
+            health_url: "".into(),
+            sessions_url: "".into(),
+            tick_interval: 1,
+            collect_interval: 30,
+            hang_warn_secs: 120,
+            hang_crit_secs: 300,
+            io_delta_threshold: 0,
+            ctx_switch_threshold: 0,
+            restart_settle_wait: 90,
+            recovery_cooldown: 1800,
+            kill_graceful_timeout: 15,
+            identity_unlock_timeout: 600,
+            mode: Mode::Sudo,
+            openclaw_dir: PathBuf::from("/home/ocagent/.openclaw"),
+            vault_dir: PathBuf::from("/opt/custom-vault"),
+            agent_user: "ocagent".into(),
+            agent_home: PathBuf::from("/home/ocagent"),
+            watchdog_user: "outerclaw".into(),
+            tg_token: "".into(),
+            tg_chat: "".into(),
+            tg_is_dedicated: false,
+            max_vault_mb: 2048,
+            io_pressure_threshold: 25.0,
+            cloud_enabled: false,
+            cloud_remote: "".into(),
+            cloud_bandwidth: 0,
+            max_response_bytes: 0,
+        };
+        // Helpers should track vault_dir, not hardcode /var/lib/outerclaw
+        assert_eq!(
+            cfg.bin_path(),
+            PathBuf::from("/opt/custom-vault/bin/outerclaw")
+        );
+        assert_eq!(
+            cfg.env_file_path(),
+            PathBuf::from("/opt/custom-vault/config/outerclaw.env")
+        );
+        assert_eq!(
+            cfg.rclone_config_path(),
+            PathBuf::from("/opt/custom-vault/config/rclone.conf")
+        );
+        assert_eq!(cfg.audit_dir(), PathBuf::from("/opt/custom-vault/audit"));
+        assert_eq!(
+            cfg.snapshots_dir(),
+            PathBuf::from("/opt/custom-vault/snapshots")
+        );
+        assert_eq!(cfg.lkg_dir(), PathBuf::from("/opt/custom-vault/lkg"));
     }
 
     #[test]
