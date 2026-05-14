@@ -92,7 +92,7 @@ pub fn show(cfg: Config, platform: Box<dyn Platform>) -> i32 {
     println!("  Security");
 
     // Three-user isolation
-    let users_ok = platform.user_exists("outerclaw").unwrap_or(false);
+    let users_ok = platform.user_exists(&cfg.watchdog_user).unwrap_or(false);
     let agent_ok = platform.user_exists(&cfg.agent_user).unwrap_or(false);
     let isolation_ok = users_ok && agent_ok;
     let isolation_label = if isolation_ok {

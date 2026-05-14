@@ -12,8 +12,6 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-const RCLONE_CONFIG_PATH: &str = "/var/lib/outerclaw/config/rclone.conf";
-const ENV_FILE_PATH: &str = "/var/lib/outerclaw/config/outerclaw.env";
 const BASE_REMOTE: &str = "outerclaw-base";
 const CRYPT_REMOTE: &str = "outerclaw-crypt";
 
@@ -63,7 +61,7 @@ pub fn run(cfg: Config, _platform: Box<dyn Platform>) -> i32 {
         }
     };
 
-    let rclone_config = PathBuf::from(RCLONE_CONFIG_PATH);
+    let rclone_config = cfg.rclone_config_path();
 
     // Ensure config directory exists
     if let Some(parent) = rclone_config.parent() {
@@ -158,7 +156,7 @@ pub fn run(cfg: Config, _platform: Box<dyn Platform>) -> i32 {
         .unwrap_or_default();
 
     // Secure the config file: chmod 600, chown outerclaw
-    secure_config_file(&rclone_config);
+    secure_config_file(&rclone_config, &cfg.watchdog_user);
 
     println!();
 
@@ -179,7 +177,7 @@ pub fn run(cfg: Config, _platform: Box<dyn Platform>) -> i32 {
 
     // ── Step 5: Enable cloud sync in outerclaw.env ──────────────
     println!("Step 5: Enable cloud sync");
-    if let Err(e) = update_env_file() {
+    if let Err(e) = update_env_file(&cfg) {
         eprintln!("ERROR: Failed to update env file: {e}");
         return 1;
     }
@@ -198,7 +196,7 @@ pub fn run(cfg: Config, _platform: Box<dyn Platform>) -> i32 {
     println!("  Remote:     {CRYPT_REMOTE} -> {remote_path}");
     println!("  Encryption: AES-256 (client-side, rclone crypt)");
     println!("  Schedule:   Every 2 hours");
-    println!("  Config:     {RCLONE_CONFIG_PATH}");
+    println!("  Config:     {}", rclone_config.display());
     println!();
     println!("  DISASTER RECOVERY -- SAVE THIS INFO:");
     println!("    To restore on a new machine, you need:");
@@ -516,17 +514,17 @@ directory_name_encryption = false\n"
     Ok(())
 }
 
-/// Set mode 0600 and chown to outerclaw on the config file.
-fn secure_config_file(config_path: &Path) {
+/// Set mode 0600 and chown to the watchdog user on the config file.
+fn secure_config_file(config_path: &Path, watchdog_user: &str) {
     // chmod 600
     use std::os::unix::fs::PermissionsExt;
     if let Err(e) = fs::set_permissions(config_path, fs::Permissions::from_mode(0o600)) {
         log::warn!("Cannot chmod rclone config: {e}");
     }
 
-    // chown outerclaw:outerclaw
-    if let Ok(Some(user)) = nix::unistd::User::from_name("outerclaw") {
-        let gid = nix::unistd::Group::from_name("outerclaw")
+    // chown watchdog:watchdog
+    if let Ok(Some(user)) = nix::unistd::User::from_name(watchdog_user) {
+        let gid = nix::unistd::Group::from_name(watchdog_user)
             .ok()
             .flatten()
             .map(|g| g.gid)
@@ -695,8 +693,8 @@ To restore on a new machine:\n\
 }
 
 /// Update outerclaw.env with CLOUD_ENABLED=true, CLOUD_REMOTE, CLOUD_BANDWIDTH.
-fn update_env_file() -> Result<(), String> {
-    let env_path = PathBuf::from(ENV_FILE_PATH);
+fn update_env_file(cfg: &Config) -> Result<(), String> {
+    let env_path = cfg.env_file_path();
 
     let mut content = if env_path.exists() {
         fs::read_to_string(&env_path).map_err(|e| format!("Cannot read env file: {e}"))?

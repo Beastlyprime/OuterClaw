@@ -42,16 +42,23 @@ pub struct TelegramBot {
     base_url: String,
     running: Arc<AtomicBool>,
     max_response_bytes: usize,
+    snapshots_dir: std::path::PathBuf,
 }
 
 impl TelegramBot {
-    pub fn new(token: &str, chat_id: &str, max_response_bytes: usize) -> Self {
+    pub fn new(
+        token: &str,
+        chat_id: &str,
+        max_response_bytes: usize,
+        snapshots_dir: std::path::PathBuf,
+    ) -> Self {
         Self {
             token: token.to_string(),
             chat_id: chat_id.to_string(),
             base_url: format!("https://api.telegram.org/bot{token}"),
             running: Arc::new(AtomicBool::new(true)),
             max_response_bytes,
+            snapshots_dir,
         }
     }
 
@@ -70,6 +77,7 @@ impl TelegramBot {
         let base_url = self.base_url.clone();
         let running = self.running.clone();
         let max_bytes = self.max_response_bytes;
+        let snapshots_dir = self.snapshots_dir.clone();
 
         log::info!("TelegramBot: polling started (chat_id={chat_id})");
 
@@ -86,6 +94,7 @@ impl TelegramBot {
                     cmd_tx,
                     status_fn,
                     max_response_bytes: max_bytes,
+                    snapshots_dir,
                 };
                 poller.poll_loop();
             })
@@ -114,6 +123,7 @@ struct Poller {
     cmd_tx: Sender<TelegramCommand>,
     status_fn: Arc<dyn Fn() -> StatusSnapshot + Send + Sync>,
     max_response_bytes: usize,
+    snapshots_dir: std::path::PathBuf,
 }
 
 impl Poller {
@@ -380,7 +390,7 @@ impl Poller {
     }
 
     fn cmd_snapshots(&self) {
-        let snapshot_dir = std::path::Path::new("/var/lib/outerclaw/snapshots");
+        let snapshot_dir = self.snapshots_dir.as_path();
         match std::fs::read_dir(snapshot_dir) {
             Ok(entries) => {
                 let mut files: Vec<(String, u64)> = entries
