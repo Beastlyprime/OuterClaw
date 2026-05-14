@@ -105,7 +105,12 @@ pub fn run(cfg: Config, platform: Box<dyn Platform>) -> i32 {
     let mut tg_bot: Option<TelegramBot> = None;
 
     if cfg.tg_is_dedicated {
-        let bot = TelegramBot::new(&cfg.tg_token, &cfg.tg_chat, cfg.max_response_bytes);
+        let bot = TelegramBot::new(
+            &cfg.tg_token,
+            &cfg.tg_chat,
+            cfg.max_response_bytes,
+            cfg.snapshots_dir(),
+        );
 
         let status_clone = status_state.clone();
         let status_fn: Arc<dyn Fn() -> StatusSnapshot + Send + Sync> =

@@ -208,8 +208,8 @@ pub fn run(args: PostmortemArgs, cfg: Config, _platform: Box<dyn Platform>) -> i
     // ── Step 10: Prune old postmortems ────────────────────────────
     prune_postmortems(&cfg.vault_dir.join("postmortem"));
 
-    // ── Step 11: Fix ownership to outerclaw ───────────────────────
-    fix_ownership_outerclaw(&pm_dir);
+    // ── Step 11: Fix ownership to the watchdog user ───────────────
+    fix_ownership_watchdog(&pm_dir, &cfg.watchdog_user);
 
     // ── Alert ─────────────────────────────────────────────────────
     send_alert(
@@ -704,9 +704,9 @@ fn prune_postmortems(pm_base: &Path) {
     }
 }
 
-/// Fix ownership on a directory to the outerclaw user (best-effort).
-fn fix_ownership_outerclaw(path: &Path) {
-    if let Ok(Some(usr)) = nix::unistd::User::from_name("outerclaw") {
+/// Fix ownership on a directory to the watchdog user (best-effort).
+fn fix_ownership_watchdog(path: &Path, watchdog_user: &str) {
+    if let Ok(Some(usr)) = nix::unistd::User::from_name(watchdog_user) {
         let _ = chown_recursive(path, usr.uid, usr.gid);
         // Also set permissions to 700
         set_permissions_recursive(path, 0o700);
