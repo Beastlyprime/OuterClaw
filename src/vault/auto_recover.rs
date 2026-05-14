@@ -114,8 +114,8 @@ fn run_inner(cfg: &Config, platform: &dyn Platform) -> Result<(), String> {
         let _ = copy_dir_recursive(&src_memory_dir, &emergency_dir.join("memory"));
     }
 
-    // Fix ownership on emergency dir to outerclaw
-    fix_ownership_outerclaw(&emergency_dir);
+    // Fix ownership on emergency dir to the watchdog user
+    fix_ownership_watchdog(&emergency_dir, &cfg.watchdog_user);
     log_alert(
         &audit_dir,
         &format!("Emergency snapshot saved: {}", emergency_dir.display()),
@@ -263,9 +263,9 @@ fn fix_ownership_recursive(path: &Path, user: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Fix ownership on a path to the outerclaw user (best-effort).
-fn fix_ownership_outerclaw(path: &Path) {
-    if let Ok(Some(usr)) = nix::unistd::User::from_name("outerclaw") {
+/// Fix ownership on a path to the watchdog user (best-effort).
+fn fix_ownership_watchdog(path: &Path, watchdog_user: &str) {
+    if let Ok(Some(usr)) = nix::unistd::User::from_name(watchdog_user) {
         let _ = chown_recursive(path, usr.uid, usr.gid);
     }
 }

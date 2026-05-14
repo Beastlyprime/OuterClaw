@@ -138,7 +138,7 @@ fn run_inner(args: &RollbackArgs, cfg: &Config, platform: &dyn Platform) -> Resu
         let _ = copy_dir_recursive(&src_memory_dir, &emergency_dir.join("memory"));
     }
 
-    fix_ownership_outerclaw(&emergency_dir);
+    fix_ownership_watchdog(&emergency_dir, &cfg.watchdog_user);
     println!("Pre-rollback snapshot saved: {}", emergency_dir.display());
 
     // ── Step 6: Restore every SQLite source present in LKG ────────
@@ -358,9 +358,9 @@ fn fix_ownership_recursive(path: &Path, user: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Fix ownership on a path to the outerclaw user (best-effort).
-fn fix_ownership_outerclaw(path: &Path) {
-    if let Ok(Some(usr)) = nix::unistd::User::from_name("outerclaw") {
+/// Fix ownership on a path to the watchdog user (best-effort).
+fn fix_ownership_watchdog(path: &Path, watchdog_user: &str) {
+    if let Ok(Some(usr)) = nix::unistd::User::from_name(watchdog_user) {
         let _ = chown_recursive(path, usr.uid, usr.gid);
     }
 }
