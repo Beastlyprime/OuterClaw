@@ -447,8 +447,16 @@ fn send_message_impl(base_url: &str, chat_id: &str, text: &str) -> bool {
 
     match resp {
         Ok(_) => true,
+        Err(ureq::Error::Status(code, r)) => {
+            let body = r
+                .into_string()
+                .unwrap_or_else(|_| "<unreadable body>".into());
+            let snippet: String = body.chars().take(500).collect();
+            log::warn!("TelegramBot sendMessage HTTP {code}: {snippet}");
+            false
+        }
         Err(e) => {
-            log::debug!("TelegramBot sendMessage error: {e}");
+            log::warn!("TelegramBot sendMessage transport error: {e}");
             false
         }
     }
