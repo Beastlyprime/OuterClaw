@@ -219,7 +219,7 @@ pub fn run(cfg: Config, platform: Box<dyn Platform>) -> i32 {
         // ── Identity auto-relock timeout ──
         if identity_mgr.check_timeout() {
             log::warn!("Identity unlock timeout -- auto-relocking");
-            let msg = identity_mgr.lock(platform.as_ref(), &cfg.openclaw_dir, "auto-timeout");
+            let msg = identity_mgr.lock("auto-timeout");
             send_alert("INFO", &msg, &cfg);
             if let Some(ref bot) = tg_bot {
                 bot.send_message("Identity files auto-relocked (10 min timeout).");
@@ -393,14 +393,14 @@ fn process_telegram_command(
             }
         }
         "unlock_identity" => {
-            let msg = identity_mgr.unlock(platform, &cfg.openclaw_dir, &format!("Telegram/{user}"));
+            let msg = identity_mgr.unlock(&format!("Telegram/{user}"));
             send_alert("WARNING", &msg, cfg);
             if let Some(bot) = tg_bot {
                 bot.send_message(&msg);
             }
         }
         "lock_identity" => {
-            let msg = identity_mgr.lock(platform, &cfg.openclaw_dir, &format!("Telegram/{user}"));
+            let msg = identity_mgr.lock(&format!("Telegram/{user}"));
             send_alert("INFO", &msg, cfg);
             if let Some(bot) = tg_bot {
                 bot.send_message(&msg);

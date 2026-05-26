@@ -6,7 +6,11 @@
 use crate::cli::{IdentityAction, IdentityArgs};
 use crate::platform::Platform;
 use std::path::PathBuf;
+use std::process::Command;
 use std::time::{Duration, Instant};
+
+const IDENTITY_LOCK_UNIT: &str = "oc-identity-lock.service";
+const IDENTITY_UNLOCK_UNIT: &str = "oc-identity-unlock.service";
 
 /// Well-known identity files (relative to workspace).
 const IDENTITY_FILES: &[&str] = &["SOUL.md", "AGENTS.md", "USER.md"];
@@ -49,9 +53,11 @@ pub fn run(args: IdentityArgs, platform: Box<dyn Platform>) -> i32 {
 
 /// In-daemon identity unlock/relock state tracker.
 ///
-/// The daemon calls `unlock()` when a Telegram `/unlock_identity` command
-/// arrives, and `check_timeout()` on every tick to auto-relock after
-/// `unlock_timeout`.
+/// The daemon itself runs unprivileged and cannot clear the immutable flag
+/// (`FS_IOC_SETFLAGS` requires `CAP_LINUX_IMMUTABLE`). Both `unlock()` and
+/// `lock()` therefore trigger the dedicated root-managed oneshot units
+/// (`oc-identity-{un}lock.service`) via the no-password sudoers entry,
+/// which in turn invoke `outerclaw identity {un}lock` as root.
 pub struct IdentityManager {
     /// When identity files were last unlocked, or `None` if locked.
     unlocked_at: Option<Instant>,
@@ -67,70 +73,44 @@ impl IdentityManager {
         }
     }
 
-    /// Unlock identity files via the platform and start the timeout.
+    /// Unlock identity files via the privileged systemd unit and start the timeout.
     ///
     /// Returns a human-readable result message.
-    pub fn unlock(
-        &mut self,
-        platform: &dyn Platform,
-        openclaw_dir: &std::path::Path,
-        source: &str,
-    ) -> String {
-        let workspace = openclaw_dir.join("workspace");
-        let mut errors = Vec::new();
-
-        for name in IDENTITY_FILES {
-            let path = workspace.join(name);
-            if !path.exists() {
-                continue;
+    pub fn unlock(&mut self, source: &str) -> String {
+        match run_identity_unit(IDENTITY_UNLOCK_UNIT) {
+            Ok(()) => {
+                self.unlocked_at = Some(Instant::now());
+                let minutes = self.unlock_timeout.as_secs() / 60;
+                let msg = format!(
+                    "Identity files UNLOCKED ({source}). Auto-relock in {minutes} minutes."
+                );
+                log::warn!("{msg}");
+                msg
             }
-            if let Err(e) = platform.set_immutable(&path, false) {
-                errors.push(format!("{name}: {e}"));
+            Err(e) => {
+                let msg = format!("Unlock failed: {e}");
+                log::error!("{msg}");
+                msg
             }
-        }
-
-        if errors.is_empty() {
-            self.unlocked_at = Some(Instant::now());
-            let minutes = self.unlock_timeout.as_secs() / 60;
-            let msg =
-                format!("Identity files UNLOCKED ({source}). Auto-relock in {minutes} minutes.");
-            log::warn!("{msg}");
-            msg
-        } else {
-            format!("Unlock partially failed: {}", errors.join("; "))
         }
     }
 
-    /// Lock identity files via the platform and clear the timeout.
+    /// Lock identity files via the privileged systemd unit and clear the timeout.
     ///
     /// Returns a human-readable result message.
-    pub fn lock(
-        &mut self,
-        platform: &dyn Platform,
-        openclaw_dir: &std::path::Path,
-        source: &str,
-    ) -> String {
-        let workspace = openclaw_dir.join("workspace");
-        let mut errors = Vec::new();
-
-        for name in IDENTITY_FILES {
-            let path = workspace.join(name);
-            if !path.exists() {
-                continue;
+    pub fn lock(&mut self, source: &str) -> String {
+        match run_identity_unit(IDENTITY_LOCK_UNIT) {
+            Ok(()) => {
+                self.unlocked_at = None;
+                let msg = format!("Identity files LOCKED ({source}).");
+                log::info!("{msg}");
+                msg
             }
-            if let Err(e) = platform.set_immutable(&path, true) {
-                errors.push(format!("{name}: {e}"));
+            Err(e) => {
+                let msg = format!("Lock failed: {e}");
+                log::error!("{msg}");
+                msg
             }
-        }
-
-        self.unlocked_at = None;
-
-        if errors.is_empty() {
-            let msg = format!("Identity files LOCKED ({source}).");
-            log::info!("{msg}");
-            msg
-        } else {
-            format!("Lock partially failed: {}", errors.join("; "))
         }
     }
 
@@ -147,6 +127,25 @@ impl IdentityManager {
     /// Whether identity files are currently unlocked.
     pub fn is_unlocked(&self) -> bool {
         self.unlocked_at.is_some()
+    }
+}
+
+/// Trigger `sudo systemctl start <unit>` and wait for the oneshot to finish.
+fn run_identity_unit(unit: &str) -> Result<(), String> {
+    let output = Command::new("sudo")
+        .args(["systemctl", "start", unit])
+        .output()
+        .map_err(|e| format!("cannot invoke sudo systemctl: {e}"))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let code = output.status.code().unwrap_or(-1);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let detail = stderr.trim();
+    if detail.is_empty() {
+        Err(format!("{unit} exited with code {code}"))
+    } else {
+        Err(format!("{unit} exited with code {code}: {detail}"))
     }
 }
 
