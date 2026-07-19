@@ -156,13 +156,18 @@ pub struct CloudRestoreArgs {
     #[arg(long)]
     pub show_hint: bool,
 
-    /// Restore a specific LKG
+    /// Restore a specific LKG by name
     #[arg(long)]
     pub restore_lkg: Option<String>,
 
-    /// Restore a specific snapshot
+    /// Restore a specific snapshot by filename
     #[arg(long)]
     pub restore_snapshot: Option<String>,
+
+    /// Restore the most recent LKG from cloud (auto-resolves the name).
+    /// This is the bootstrap path: no need to know LKG names in advance.
+    #[arg(long, conflicts_with_all = ["list", "show_hint", "restore_lkg", "restore_snapshot"])]
+    pub latest_lkg: bool,
 }
 
 #[derive(clap::Args)]
