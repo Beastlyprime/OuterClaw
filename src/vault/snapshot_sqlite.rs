@@ -138,15 +138,41 @@ fn snapshot_one(
     // would make SQLite try to create a hot journal in the source's directory and
     // write to the -shm sidecar of a WAL database — neither of which outerclaw
     // has permission for (and shouldn't, by minimum-privilege design).
-    {
-        let conn =
-            rusqlite::Connection::open_with_flags(src, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
-                .map_err(|e| format!("Cannot open source DB: {e}"))?;
-        let vacuum_sql = format!("VACUUM INTO '{}'", dst_tmp.display());
-        conn.execute_batch(&vacuum_sql).map_err(|e| {
+    if let Err(e) = vacuum_into(src, &dst_tmp, false) {
+        let _ = fs::remove_file(&dst_tmp);
+        // A WAL-flagged database whose writer has closed (no -wal/-shm on
+        // disk) is unreadable through a plain read-only connection: SQLite
+        // must create the -shm index in the source directory, which
+        // minimum privilege forbids (SQLITE_READONLY). With no writer
+        // attached the file cannot change mid-copy, so `immutable=1` is
+        // safe — guarded by a before/after stat in case a writer races in.
+        if !is_idle_wal(src) {
+            return Err(format!("VACUUM INTO failed: {e}"));
+        }
+        let before = fs::metadata(src).map_err(|e| format!("Cannot stat {}: {e}", src.display()))?;
+        vacuum_into(src, &dst_tmp, true).map_err(|e| {
             let _ = fs::remove_file(&dst_tmp);
-            format!("VACUUM INTO failed: {e}")
+            format!("VACUUM INTO (immutable fallback) failed: {e}")
         })?;
+        let after =
+            fs::metadata(src).map_err(|e| format!("Cannot stat {}: {e}", src.display()))?;
+        if before.len() != after.len()
+            || before.modified().ok() != after.modified().ok()
+            || !is_idle_wal(src)
+        {
+            let _ = fs::remove_file(&dst_tmp);
+            return Err(format!(
+                "{} changed during immutable-fallback snapshot; discarded (will retry next cycle)",
+                src.display()
+            ));
+        }
+        log_backup(
+            &cfg.vault_dir,
+            &format!(
+                "INFO: {} read via immutable fallback (WAL-flagged, no live sidecars)",
+                source.label
+            ),
+        );
     }
 
     // ── Integrity check ────────────────────────────────────────────
@@ -218,6 +244,47 @@ fn snapshot_one(
     prune_sqlite_snapshots_by_label(dst_dir, source.label);
 
     Ok(true)
+}
+
+/// `VACUUM INTO` a copy of `src` at `dst_tmp` through a read-only connection.
+///
+/// With `immutable`, the source is opened via an `immutable=1` URI, which
+/// bypasses WAL and locking entirely — only valid while nothing can write to
+/// the database (see `is_idle_wal`).
+fn vacuum_into(src: &Path, dst_tmp: &Path, immutable: bool) -> Result<(), String> {
+    let conn = if immutable {
+        rusqlite::Connection::open_with_flags(
+            format!("file:{}?immutable=1", src.display()),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+        )
+    } else {
+        rusqlite::Connection::open_with_flags(src, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+    }
+    .map_err(|e| format!("Cannot open source DB: {e}"))?;
+    conn.execute_batch(&format!("VACUUM INTO '{}'", dst_tmp.display()))
+        .map_err(|e| e.to_string())
+}
+
+/// True when `src` carries the WAL flag in its header but has neither `-wal`
+/// nor `-shm` sidecar on disk — i.e. the last writer closed cleanly and no
+/// connection currently holds the database open. In that state the file is
+/// stable, but a plain read-only connection still cannot read it without
+/// creating the WAL index in the (unwritable) source directory.
+fn is_idle_wal(src: &Path) -> bool {
+    let mut header = [0u8; 20];
+    let read_ok = fs::File::open(src)
+        .and_then(|mut f| std::io::Read::read_exact(&mut f, &mut header))
+        .is_ok();
+    // Bytes 18/19 are the file-format write/read versions: 2 means WAL.
+    if !read_ok || !header.starts_with(b"SQLite format 3\0") || header[18] != 2 {
+        return false;
+    }
+    let sidecar = |suffix: &str| {
+        let mut name = src.as_os_str().to_os_string();
+        name.push(suffix);
+        PathBuf::from(name)
+    };
+    !sidecar("-wal").exists() && !sidecar("-shm").exists()
 }
 
 /// Generate a local-time timestamp in `YYYYMMDD-HHMMSS` format using libc.
@@ -374,5 +441,90 @@ fn format_size(bytes: u64) -> String {
         format!("{:.1}K", bytes as f64 / 1024.0)
     } else {
         format!("{bytes}B")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Create a WAL-mode database with one table, then close it cleanly so
+    /// the -wal/-shm sidecars are removed but the header keeps the WAL flag.
+    fn make_idle_wal_db(path: &Path) {
+        let conn = rusqlite::Connection::open(path).unwrap();
+        conn.execute_batch(
+            "PRAGMA journal_mode=WAL;
+             CREATE TABLE chunks(id INTEGER PRIMARY KEY, data TEXT);
+             INSERT INTO chunks(data) VALUES ('a'), ('b'), ('c');",
+        )
+        .unwrap();
+        drop(conn);
+        assert!(!path.with_extension("sqlite-wal").exists());
+    }
+
+    #[test]
+    fn test_is_idle_wal_detection() {
+        let dir = std::env::temp_dir().join("outerclaw_snapshot_test_idle_wal");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        // WAL-flagged, no sidecars → idle WAL.
+        let wal_db = dir.join("wal.sqlite");
+        make_idle_wal_db(&wal_db);
+        assert!(is_idle_wal(&wal_db));
+
+        // Rollback-journal database → not idle WAL.
+        let rollback_db = dir.join("rollback.sqlite");
+        let conn = rusqlite::Connection::open(&rollback_db).unwrap();
+        conn.execute_batch("CREATE TABLE t(x);").unwrap();
+        drop(conn);
+        assert!(!is_idle_wal(&rollback_db));
+
+        // WAL database with a live connection (sidecars present) → not idle.
+        let live_db = dir.join("live.sqlite");
+        let conn = rusqlite::Connection::open(&live_db).unwrap();
+        conn.execute_batch("PRAGMA journal_mode=WAL; CREATE TABLE t(x); INSERT INTO t VALUES (1);")
+            .unwrap();
+        assert!(!is_idle_wal(&live_db));
+        drop(conn);
+
+        // Missing / non-SQLite files → not idle WAL.
+        assert!(!is_idle_wal(&dir.join("missing.sqlite")));
+        let junk = dir.join("junk.sqlite");
+        fs::write(&junk, b"not a database").unwrap();
+        assert!(!is_idle_wal(&junk));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_vacuum_into_immutable_reads_idle_wal_in_readonly_dir() {
+        // Reproduces the production failure: an idle WAL database in a
+        // directory the snapshot user cannot write to. The plain read-only
+        // open must fail (cannot create -shm), the immutable fallback must
+        // succeed and produce a valid copy.
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join("outerclaw_snapshot_test_ro_dir");
+        let _ = fs::remove_dir_all(&dir);
+        let src_dir = dir.join("src");
+        fs::create_dir_all(&src_dir).unwrap();
+        let src = src_dir.join("main.sqlite");
+        make_idle_wal_db(&src);
+        fs::set_permissions(&src_dir, fs::Permissions::from_mode(0o555)).unwrap();
+
+        let dst = dir.join("copy.sqlite");
+        // Skip the plain-open assertion when running as root (root ignores
+        // directory permissions, so only the fallback path is checkable).
+        let is_root = unsafe { libc::geteuid() } == 0;
+        if !is_root {
+            assert!(vacuum_into(&src, &dst, false).is_err());
+            assert!(is_idle_wal(&src));
+        }
+        vacuum_into(&src, &dst, true).unwrap();
+        assert_eq!(count_rows(&dst, "chunks"), 3);
+
+        fs::set_permissions(&src_dir, fs::Permissions::from_mode(0o755)).unwrap();
+        let _ = fs::remove_dir_all(&dir);
     }
 }
