@@ -149,13 +149,13 @@ fn snapshot_one(
         if !is_idle_wal(src) {
             return Err(format!("VACUUM INTO failed: {e}"));
         }
-        let before = fs::metadata(src).map_err(|e| format!("Cannot stat {}: {e}", src.display()))?;
+        let before =
+            fs::metadata(src).map_err(|e| format!("Cannot stat {}: {e}", src.display()))?;
         vacuum_into(src, &dst_tmp, true).map_err(|e| {
             let _ = fs::remove_file(&dst_tmp);
             format!("VACUUM INTO (immutable fallback) failed: {e}")
         })?;
-        let after =
-            fs::metadata(src).map_err(|e| format!("Cannot stat {}: {e}", src.display()))?;
+        let after = fs::metadata(src).map_err(|e| format!("Cannot stat {}: {e}", src.display()))?;
         if before.len() != after.len()
             || before.modified().ok() != after.modified().ok()
             || !is_idle_wal(src)
