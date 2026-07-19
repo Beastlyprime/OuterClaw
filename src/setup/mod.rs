@@ -292,6 +292,16 @@ fn deploy_inner(cfg: &Config, _platform: &dyn Platform) -> i32 {
     let dest_bin = cfg.bin_path();
     match std::env::current_exe() {
         Ok(self_path) => {
+            // Unlink the old binary first: overwriting a running executable
+            // fails with ETXTBSY while the daemon has it mapped, but removing
+            // the directory entry is allowed — the daemon keeps running the
+            // old (now anonymous) inode until its next restart.
+            if dest_bin.exists() && self_path != dest_bin {
+                if let Err(e) = fs::remove_file(&dest_bin) {
+                    eprintln!("  ERROR removing old {}: {e}", dest_bin.display());
+                    return 1;
+                }
+            }
             if let Err(e) = fs::copy(&self_path, &dest_bin) {
                 eprintln!(
                     "  ERROR copying {} -> {}: {e}",
